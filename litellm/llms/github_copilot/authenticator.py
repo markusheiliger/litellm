@@ -190,14 +190,14 @@ class Authenticator:
         """Return the stored GitHub access token, loading it with device flow when needed."""
         return self.get_access_token()
 
-    def get_api_base(self) -> str | None:
+    def get_api_base(self, access_token: str | None = None) -> str | None:
         """Return the Copilot API endpoint for a stored token without starting device flow."""
-        access_token: Final = self._stored_access_token()
-        if access_token is None:
+        stored_token: Final = access_token if access_token is not None else self.get_stored_access_token()
+        if stored_token is None:
             return None
-        return _copilot_api_base_for_token(access_token)
+        return _copilot_api_base_for_token(stored_token)
 
-    def _stored_access_token(self) -> str | None:
+    def get_stored_access_token(self) -> str | None:
         try:
             access_token: Final = _read_token_file(self.access_token_file).strip()
         except (OSError, ValueError):

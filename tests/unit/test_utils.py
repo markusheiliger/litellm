@@ -9722,6 +9722,45 @@ def test_get_valid_models_asks_a_provider_once_when_many_listings_start_together
     assert (listings, catalog.call_count) == (frozenset({("openrouter/anthropic/claude-haiku-5-5",)}), 1)
 
 
+@respx.mock
+def test_copilot_sdk_listing_surfaces_authentication_failures_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reset_mock_cache: None
+) -> None:
+    from litellm.exceptions import AuthenticationError
+
+    monkeypatch.setenv("GITHUB_COPILOT_TOKEN_DIR", str(tmp_path))
+    (tmp_path / "access-token").write_text(f"listing-{tmp_path.name}")
+    endpoint: Final = "https://api.sdk.githubcopilot.com/models"
+    catalog: Final = respx.get(endpoint).mock(
+        side_effect=(httpx.Response(401), httpx.Response(200, json={"data": [{"id": "caller-model"}]}))
+    )
+    params: Final = LiteLLM_Params(model="github_copilot/*", api_base=endpoint.removesuffix("/models"))
+
+    with pytest.raises(AuthenticationError, match="rejected"):
+        get_valid_models(
+            check_provider_endpoint=True, custom_llm_provider="github_copilot", litellm_params=params
+        )
+    result: Final = get_valid_models(
+        check_provider_endpoint=True, custom_llm_provider="github_copilot", litellm_params=params
+    )
+
+    assert (result, catalog.call_count) == (["github_copilot/caller-model"], 2)
+
+
+@respx.mock
+def test_copilot_bundled_listing_does_not_require_a_connected_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.utils import bundled_provider_models
+
+    monkeypatch.setenv("GITHUB_COPILOT_TOKEN_DIR", str(tmp_path))
+    monkeypatch.setattr(litellm, "check_provider_endpoint", False)
+
+    result: Final = get_valid_models(check_provider_endpoint=False, custom_llm_provider="github_copilot")
+
+    assert result == list(bundled_provider_models("github_copilot"))
+
+
 @pytest.fixture
 def isolated_openai_model_sets(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(

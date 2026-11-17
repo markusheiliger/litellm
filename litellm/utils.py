@@ -9132,6 +9132,10 @@ def _get_valid_models_from_provider_api(
     custom_llm_provider: str,
     litellm_params: LiteLLM_Params | None = None,
 ) -> list[str]:
+    if custom_llm_provider == LlmProviders.GITHUB_COPILOT:
+        return provider_config.discover_models(
+            litellm_params=_provider_listing_params(custom_llm_provider, litellm_params)
+        )
     with _model_cache.listing_lock(custom_llm_provider, litellm_params):
         try:
             cached_result: Final = _model_cache.get_cached_model_info(custom_llm_provider, litellm_params)
@@ -9233,6 +9237,22 @@ def get_valid_models(
 
         return valid_models
     except Exception as e:
+        if (
+            (check_provider_endpoint or litellm.check_provider_endpoint)
+            and isinstance(
+                e,
+                (
+                    litellm.AuthenticationError,
+                    litellm.BadRequestError,
+                    litellm.APIConnectionError,
+                    litellm.RateLimitError,
+                    litellm.ServiceUnavailableError,
+                    litellm.Timeout,
+                ),
+            )
+            and e.llm_provider == LlmProviders.GITHUB_COPILOT
+        ):
+            raise
         verbose_logger.warning("Error getting valid models: %s", e)
         return []  # NON-Blocking
 
@@ -10828,6 +10848,10 @@ class ProviderConfigManager:
         model: str | None,
         provider: LlmProviders,
     ) -> BaseLLMModelInfo | None:
+        if provider == LlmProviders.GITHUB_COPILOT:
+            from litellm.llms.github_copilot.model_info import GithubCopilotModelInfo
+
+            return GithubCopilotModelInfo()
         if provider == LlmProviders.OPENCODE_GO:
             from litellm.llms.opencode.chat.transformation import OpenCodeGoChatConfig
 
