@@ -1,9 +1,16 @@
+from __future__ import annotations
+
 import hashlib
 import json
 import os
 import time
 from collections.abc import Mapping
-from typing import Final, Protocol, cast  # noqa: TID251  # pins untyped clients and caches to local Protocols
+from typing import (
+    TYPE_CHECKING,
+    Final,
+    Protocol,
+    cast,  # noqa: TID251  # pins untyped clients and caches to local Protocols
+)
 
 import httpx
 from pydantic import ConfigDict, TypeAdapter, with_config
@@ -19,6 +26,9 @@ from .common_utils import (
     GetAccessTokenError,
     GetDeviceCodeError,
 )
+
+if TYPE_CHECKING:
+    from .github_host import GithubHostEndpoints
 
 # Constants (default values — overridable via environment variables at call time)
 DEFAULT_GITHUB_CLIENT_ID: Final = "Iv1.b507a08c87ecfe98"
@@ -72,8 +82,20 @@ _COPILOT_API_BASE_CACHE: Final[_CopilotAPIBaseCache] = cast(  # cast-ok: [LIT006
 )
 
 
-def _copilot_api_base_for_token(access_token: str) -> str | None:
-    cache_key: Final = hashlib.sha256(access_token.encode()).hexdigest()
+def _shared_endpoints() -> GithubHostEndpoints:
+    from .github_host import github_host_endpoints, normalized_github_host
+
+    host: Final = normalized_github_host(os.getenv("GITHUB_COPILOT_HOST"))
+    if host is None:
+        raise GetAccessTokenError(
+            message="GITHUB_COPILOT_HOST must be github.com or a single enterprise hostname ending in .ghe.com.",
+            status_code=400,
+        )
+    return github_host_endpoints(host)
+
+
+def _copilot_api_base_for_token(access_token: str, endpoints: GithubHostEndpoints) -> str | None:
+    cache_key: Final = hashlib.sha256(f"{endpoints.host}\0{access_token}".encode()).hexdigest()
     cached_api_base: Final[object] = _COPILOT_API_BASE_CACHE.get_cache(cache_key)
     if isinstance(cached_api_base, str):
         return cached_api_base
@@ -83,24 +105,27 @@ def _copilot_api_base_for_token(access_token: str) -> str | None:
             _SyncGetClient,
             get_httpx_client(),
         ).get(
-            DEFAULT_GITHUB_COPILOT_USER_URL,
+            endpoints.copilot_user_url,
             headers=github_api_headers(access_token),
         )
         if not response.is_success:
+            verbose_logger.warning("GitHub Copilot account lookup returned HTTP %s.", response.status_code)
             return None
         payload: Final[Mapping[str, object]] = _JSON_OBJECT.validate_python(response.json())
-        endpoints: Final[Mapping[str, object]] = _JSON_OBJECT.validate_python(payload.get("endpoints"))
-        api_base: Final[object] = endpoints.get("api")
+        account_endpoints: Final[Mapping[str, object]] = _JSON_OBJECT.validate_python(payload.get("endpoints"))
+        api_base: Final[object] = account_endpoints.get("api")
         if not isinstance(api_base, str):
+            verbose_logger.warning("GitHub Copilot account lookup omitted its API endpoint.")
             return None
-        from .github_host import github_host_endpoints
         from .per_user_auth import validated_copilot_api_base
 
-        validated: Final = validated_copilot_api_base(api_base, github_host_endpoints("github.com"))
+        validated: Final = validated_copilot_api_base(api_base, endpoints)
         if validated != api_base.rstrip("/"):
+            verbose_logger.warning("GitHub Copilot account lookup returned an endpoint outside the configured host.")
             return None
         _COPILOT_API_BASE_CACHE.set_cache(cache_key, validated)
-    except Exception:
+    except (httpx.HTTPError, ValueError, TypeError):
+        verbose_logger.warning("GitHub Copilot account lookup failed or returned an invalid response.")
         return None
     else:
         return validated
@@ -122,13 +147,39 @@ def github_api_headers(
     return headers
 
 
+def shared_copilot_api_base(
+    authenticator: Authenticator, api_base: str | None = None, *, access_token: str | None = None
+) -> str:
+    endpoints: Final = _shared_endpoints()
+    discovered: Final = (
+        None
+        if api_base
+        else authenticator.get_api_base()
+        if access_token is None
+        else authenticator.get_api_base(access_token)
+    )
+    selected: Final = (
+        api_base or discovered or os.getenv("GITHUB_COPILOT_API_BASE") or endpoints.default_copilot_api_base
+    )
+    if endpoints.host != "github.com":
+        from .per_user_auth import validated_copilot_api_base
+
+        if validated_copilot_api_base(selected, endpoints) != selected.rstrip("/"):
+            raise GetAccessTokenError(
+                message="The configured Copilot API endpoint does not match GITHUB_COPILOT_HOST.",
+                status_code=400,
+            )
+    return selected
+
+
 class Authenticator:
     def __init__(self) -> None:
         """Initialize the GitHub Copilot authenticator with configurable token paths."""
-        # Token storage paths
+        self.endpoints = _shared_endpoints()
+        default_dir: Final = os.path.expanduser("~/.config/litellm/github_copilot")
         self.token_dir = os.getenv(
             "GITHUB_COPILOT_TOKEN_DIR",
-            os.path.expanduser("~/.config/litellm/github_copilot"),
+            default_dir if self.endpoints.host == "github.com" else os.path.join(default_dir, self.endpoints.host),
         )
         self.access_token_file = os.path.join(
             self.token_dir,
@@ -195,7 +246,7 @@ class Authenticator:
         stored_token: Final = access_token if access_token is not None else self.get_stored_access_token()
         if stored_token is None:
             return None
-        return _copilot_api_base_for_token(stored_token)
+        return _copilot_api_base_for_token(stored_token, self.endpoints)
 
     def get_stored_access_token(self) -> str | None:
         try:
@@ -233,8 +284,9 @@ class Authenticator:
         """
         try:
             sync_client: Final = get_httpx_client()
-            device_code_url: Final = os.getenv("GITHUB_COPILOT_DEVICE_CODE_URL", DEFAULT_GITHUB_DEVICE_CODE_URL)
-            client_id: Final = os.getenv("GITHUB_COPILOT_CLIENT_ID", DEFAULT_GITHUB_CLIENT_ID)
+            endpoints: Final = _shared_endpoints()
+            device_code_url: Final = endpoints.device_code_url
+            client_id: Final = endpoints.client_id
             resp: Final = sync_client.post(
                 device_code_url,
                 headers=self._get_github_headers(),
@@ -287,8 +339,9 @@ class Authenticator:
         sync_client: Final = get_httpx_client()
         max_attempts: Final = 12  # 1 minute (12 * 5 seconds)
 
-        access_token_url: Final = os.getenv("GITHUB_COPILOT_ACCESS_TOKEN_URL", DEFAULT_GITHUB_ACCESS_TOKEN_URL)
-        client_id: Final = os.getenv("GITHUB_COPILOT_CLIENT_ID", DEFAULT_GITHUB_CLIENT_ID)
+        endpoints: Final = _shared_endpoints()
+        access_token_url: Final = endpoints.access_token_url
+        client_id: Final = endpoints.client_id
 
         for attempt in range(max_attempts):
             try:

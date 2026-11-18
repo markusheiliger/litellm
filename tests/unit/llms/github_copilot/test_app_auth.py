@@ -558,6 +558,10 @@ async def test_caller_headers_keep_device_login_wire_headers_and_cannot_unpin_ap
     monkeypatch.setenv("TEST_APP_KEY", private_key)
     _ = (tmp_path / "access-token").write_text("gho_device_token")
     _ = respx_mock.post(_CONFIG.token_url).respond(201, json=token_payload())
+    if not app:
+        _ = respx_mock.get("https://api.github.com/copilot_internal/user").respond(
+            200, json={"endpoints": {"api": _CONFIG.api_base}}
+        )
     upstream: Final = respx_mock.post(host="api.githubcopilot.com").respond(200, json=_model_payload("chat"))
     app_fields: Final = {
         "github_copilot_auth_type": "github_app",

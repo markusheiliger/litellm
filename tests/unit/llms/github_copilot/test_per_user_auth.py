@@ -86,6 +86,7 @@ def github_http(respond: Callable[[httpx.Request], httpx.Response]):
         patch("litellm.llms.custom_httpx.http_handler.get_async_httpx_client", return_value=async_client),
         patch("litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client", return_value=async_client),
         patch("litellm.llms.custom_httpx.llm_http_handler.get_httpx_client", return_value=sync_client),
+        patch("litellm.llms.github_copilot.authenticator.get_httpx_client", return_value=sync_client),
         patch.object(litellm, "module_level_client", sync_client),
     ):
         yield requests

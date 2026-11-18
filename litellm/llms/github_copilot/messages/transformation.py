@@ -7,9 +7,8 @@ from litellm.llms.anthropic.messages.native.transformation import (
     AnthropicMessagesConfig,
 )
 
-from ..authenticator import Authenticator
+from ..authenticator import Authenticator, shared_copilot_api_base
 from ..common_utils import (
-    DEFAULT_GITHUB_COPILOT_API_BASE,
     GetAccessTokenError,
     get_copilot_default_headers,
     pin_session_authorization,
@@ -76,9 +75,7 @@ class GithubCopilotAnthropicMessagesConfig(AnthropicMessagesConfig):
             cast("dict[str, object]", litellm_params)  # cast-ok: litellm_params arrives as an untyped request dict
         )
         dynamic_api_base: Final = (
-            user_session.api_base
-            if user_session is not None
-            else (self.authenticator.get_api_base() or DEFAULT_GITHUB_COPILOT_API_BASE)
+            user_session.api_base if user_session is not None else shared_copilot_api_base(self.authenticator)
         ).rstrip("/")
         try:
             dynamic_api_key: Final = (
@@ -141,7 +138,6 @@ class GithubCopilotAnthropicMessagesConfig(AnthropicMessagesConfig):
         resolved: Final = (
             (user_session.api_base if user_session is not None else None)
             or api_base
-            or self.authenticator.get_api_base()
-            or DEFAULT_GITHUB_COPILOT_API_BASE
+            or shared_copilot_api_base(self.authenticator)
         )
         return ensure_api_route(resolved, "v1/messages")

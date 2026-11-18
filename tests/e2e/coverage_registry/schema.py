@@ -54,6 +54,7 @@ LlmRoute = Literal[
     "bedrock_invoke",
     "cohere",
     "gemini",
+    "github_copilot",
     "hosted_vllm",
     "ollama",
     "ollama_chat",

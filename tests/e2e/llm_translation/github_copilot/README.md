@@ -5,6 +5,22 @@ The default pipeline deselects every Copilot case without checking those credent
 only in a provisioned environment. Once enabled, missing secrets, connections, models and provider errors fail the run.
 The existing opt-in mechanism treats any nonempty value as enabled, including `0`. Unset a switch to disable it.
 
+## Host and identity selection
+
+Select one host per run with `E2E_GITHUB_COPILOT_HOST`. It defaults to `github.com` and also accepts a bare
+`<enterprise>.ghe.com` hostname. URLs, literal wildcards, nested enterprise subdomains and custom GitHub
+Enterprise Server domains are not supported.
+
+```bash
+export E2E_GITHUB_COPILOT_HOST=github.com
+```
+
+For an enterprise run, set it to your enterprise hostname instead. Use a matching proxy configuration and a
+separate set of dedicated accounts, approved connections, App identifiers and secret files for that host.
+The runner does not select identities from `gh`, your editor, `GH_HOST`, `GITHUB_TOKEN` or the development
+proxy's `GITHUB_COPILOT_HOST`. Missing test credentials fail rather than falling back to those identities.
+Your development login does not need to change.
+
 ## Proxy setup
 
 Use an externally provisioned proxy built from the revision under test. The tests do not start a proxy, register a
@@ -39,6 +55,30 @@ Discovery cases require exclusive use of a stack configured with `litellm_settin
 without unrelated suites sharing its deployments or database. `E2E_PROXY_WIDE_CONFIG_STACK=1` opts into those
 cases, but does not provision or reconfigure the stack.
 
+Set `GITHUB_COPILOT_HOST` explicitly for the shared-auth test proxy process. Its value must match
+`E2E_GITHUB_COPILOT_HOST` and the named credentials below. Give the process a dedicated
+`GITHUB_COPILOT_TOKEN_DIR`, never your development token directory. Per-user and App authentication select
+their host from the named credential rather than the shared-auth process setting.
+
+For a local proxy, use a copy of the development config with a dedicated database and credentials. Point both
+`router_settings.redis_host` / `redis_port` and `general_settings.coordination_redis.host` / `port` at the same
+dedicated Redis instance, with credentials when required. Pass the test environment explicitly when starting it.
+
+```bash
+env -u GITHUB_COPILOT_API_BASE -u GITHUB_COPILOT_DEVICE_CODE_URL -u GITHUB_COPILOT_ACCESS_TOKEN_URL \
+  -u GITHUB_COPILOT_CLIENT_ID \
+  GITHUB_COPILOT_HOST="$E2E_GITHUB_COPILOT_HOST" \
+  GITHUB_COPILOT_TOKEN_DIR="/secure/copilot-$E2E_GITHUB_COPILOT_HOST/shared" \
+  GITHUB_COPILOT_ACCESS_TOKEN_FILE=access-token \
+  python litellm/proxy/proxy_cli.py --config /secure/copilot-e2e-config.yaml \
+  --num_workers 2 --detailed_debug --reload --use_v2_migration_resolver \
+  2>&1 | tee /secure/copilot-e2e.log
+```
+
+Keep logs private. Check that two worker PIDs are serving. If reload reports that it ignores the worker count,
+record that limitation instead. For Docker, pass the same host variables explicitly and mount only the
+dedicated test token directory and App secrets.
+
 ### Named credentials
 
 Provision distinct named credentials for shared and App authentication and one per-user credential shared by the two
@@ -50,16 +90,19 @@ credential_list:
   - credential_name: e2e-copilot-shared
     credential_values:
       github_copilot_auth_type: shared
+      github_copilot_host: os.environ/E2E_GITHUB_COPILOT_HOST
     credential_info:
       custom_llm_provider: github_copilot
   - credential_name: e2e-copilot-users
     credential_values:
       github_copilot_auth_type: per_user_oauth
+      github_copilot_host: os.environ/E2E_GITHUB_COPILOT_HOST
     credential_info:
       custom_llm_provider: github_copilot
   - credential_name: e2e-copilot-app
     credential_values:
       github_copilot_auth_type: github_app
+      github_copilot_host: os.environ/E2E_GITHUB_COPILOT_HOST
       github_copilot_app_id: os.environ/GITHUB_COPILOT_APP_ID
       github_copilot_app_installation_id: os.environ/GITHUB_COPILOT_APP_INSTALLATION_ID
       github_copilot_app_private_key_ref: GITHUB_COPILOT_APP_PRIVATE_KEY
@@ -69,10 +112,22 @@ credential_list:
 
 ## Account and App prerequisites
 
-For shared mode, complete device login outside the proxy with
-`python -c "from litellm.llms.github_copilot.authenticator import Authenticator; Authenticator().get_access_token()"`.
+For shared mode, complete device login outside the proxy with the selected host and a dedicated directory.
+Approve the device code using the intended test account, using a separate browser profile if necessary.
+
+```bash
+umask 077
+env -u GITHUB_COPILOT_DEVICE_CODE_URL -u GITHUB_COPILOT_ACCESS_TOKEN_URL -u GITHUB_COPILOT_CLIENT_ID \
+  GITHUB_COPILOT_HOST="$E2E_GITHUB_COPILOT_HOST" \
+  GITHUB_COPILOT_TOKEN_DIR="/secure/copilot-$E2E_GITHUB_COPILOT_HOST/shared" \
+  GITHUB_COPILOT_ACCESS_TOKEN_FILE=access-token \
+  python -c "from litellm.llms.github_copilot.authenticator import Authenticator; Authenticator().get_access_token()"
+```
+
 Mount that login's token directory into the proxy and set its `GITHUB_COPILOT_TOKEN_DIR`. Make the same dedicated
 `access-token` available to the runner through a protected file. Do not copy tokens into committed config.
+The legacy default token location remains unchanged for GitHub.com. Enterprise defaults are host-specific, but
+these tests should always use explicitly selected directories to avoid reusing any development login.
 
 For per-user mode, create two dedicated LiteLLM users with distinct entitled GitHub accounts. As each user, connect
 `e2e-copilot-users` through the dashboard, or call `POST /credentials/e2e-copilot-users/user_connection/start`, approve
@@ -84,7 +139,10 @@ Respect the returned polling interval and wait for `connected`. Do not send the 
 Provide an OAuth token for the same dedicated GitHub account and OAuth app to the runner in a protected file.
 The start/poll API deliberately does not return the saved token. Obtain the runner token through a separate
 human-approved device login using the command above, a separate `GITHUB_COPILOT_TOKEN_DIR` for each user and the
-same `GITHUB_COPILOT_CLIENT_ID` as the proxy. This independently authorizes the same account without reading
+same explicitly selected OAuth client as the proxy. The commands above clear a development
+`GITHUB_COPILOT_CLIENT_ID` and use the provider default. For a custom test client, remove that unset option and add
+the same explicit `GITHUB_COPILOT_CLIENT_ID` assignment alongside the host in both commands.
+This independently authorizes the same account without reading
 the proxy database. The suite compares its GitHub identity with the saved connection. Do not substitute a personal
 access token or a token from another OAuth app. Supply each user's LiteLLM user ID, not their GitHub login.
 Routine tests preserve these users and connections.
@@ -101,22 +159,23 @@ Set the following runner variables for the modes selected. Secret values remain 
 
 ```bash
 export E2E_GITHUB_COPILOT_SHARED_CREDENTIAL=e2e-copilot-shared
-export E2E_GITHUB_COPILOT_SHARED_TOKEN_FILE=/secure/copilot-shared/access-token
+export E2E_GITHUB_COPILOT_SHARED_TOKEN_FILE="/secure/copilot-$E2E_GITHUB_COPILOT_HOST/shared/access-token"
 export E2E_GITHUB_COPILOT_USER_A_CREDENTIAL=e2e-copilot-users
 export E2E_GITHUB_COPILOT_USER_A_ID='<first-litellm-user-id>'
-export E2E_GITHUB_COPILOT_USER_A_TOKEN_FILE=/secure/copilot-user-a-token
+export E2E_GITHUB_COPILOT_USER_A_TOKEN_FILE="/secure/copilot-$E2E_GITHUB_COPILOT_HOST/user-a/access-token"
 export E2E_GITHUB_COPILOT_USER_B_CREDENTIAL=e2e-copilot-users
 export E2E_GITHUB_COPILOT_USER_B_ID='<second-litellm-user-id>'
-export E2E_GITHUB_COPILOT_USER_B_TOKEN_FILE=/secure/copilot-user-b-token
+export E2E_GITHUB_COPILOT_USER_B_TOKEN_FILE="/secure/copilot-$E2E_GITHUB_COPILOT_HOST/user-b/access-token"
 export E2E_GITHUB_COPILOT_APP_CREDENTIAL=e2e-copilot-app
 export E2E_GITHUB_COPILOT_APP_ID='<app-or-client-id>'
 export E2E_GITHUB_COPILOT_APP_INSTALLATION_ID='<installation-id>'
-export E2E_GITHUB_COPILOT_APP_PRIVATE_KEY_FILE=/secure/copilot-app.pem
+export E2E_GITHUB_COPILOT_APP_PRIVATE_KEY_FILE="/secure/copilot-$E2E_GITHUB_COPILOT_HOST/app.pem"
 ```
 
 These are runner variables, separate from the proxy's secret environment. Run without shell tracing or pytest
 `--showlocals`. Do not publish secret files, full environment dumps or provider authentication responses.
-The current suite targets GitHub.com accounts. Enterprise-host-specific authorization is not qualified here.
+`E2E_GITHUB_COPILOT_HOST` also selects the runner's account, identity and installation-token API endpoints.
+Enterprise catalog endpoints must belong to that same tenant. The named proxy credential must match the selected host.
 
 ## Running the tests
 
@@ -139,6 +198,19 @@ enable both switches. Do not run that proxy alongside other suites sharing its d
 ```bash
 E2E_GITHUB_COPILOT_LIVE=1 E2E_PROXY_WIDE_CONFIG_STACK=1 uv run --group e2e-dev pytest \
   tests/e2e/llm_translation/github_copilot/ --reruns 0 -v
+```
+
+Qualify GitHub.com and your enterprise separately, each against its matching proxy and secret configuration.
+Load the matching runner variables before each command. These commands do not switch proxies or secret files.
+Keep separate result files. A passing run on one host does not qualify the other.
+
+```bash
+E2E_GITHUB_COPILOT_HOST=github.com E2E_GITHUB_COPILOT_LIVE=1 E2E_PROXY_WIDE_CONFIG_STACK=1 \
+  uv run --group e2e-dev pytest tests/e2e/llm_translation/github_copilot/ \
+  --reruns 0 -v --junitxml=/tmp/copilot-github-com.xml
+E2E_GITHUB_COPILOT_HOST='<enterprise>.ghe.com' E2E_GITHUB_COPILOT_LIVE=1 E2E_PROXY_WIDE_CONFIG_STACK=1 \
+  uv run --group e2e-dev pytest tests/e2e/llm_translation/github_copilot/ \
+  --reruns 0 -v --junitxml=/tmp/copilot-enterprise.xml
 ```
 
 Select one mode or endpoint using normal pytest node selection. For example, append

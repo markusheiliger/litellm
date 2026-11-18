@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal, NoReturn, TypeAlias, assert_never
@@ -26,8 +25,8 @@ from litellm.llms.custom_httpx.http_handler import HTTPHandler
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.router import LiteLLM_Params
 
-from .authenticator import Authenticator
-from .common_utils import DEFAULT_GITHUB_COPILOT_API_BASE, get_copilot_default_headers, pin_session_authorization
+from .authenticator import Authenticator, shared_copilot_api_base
+from .common_utils import get_copilot_default_headers, pin_session_authorization
 from .per_user_auth import (
     GITHUB_COPILOT_USER_SESSION_KWARG_KEY,
     GithubCopilotUserSession,
@@ -111,11 +110,8 @@ def _resolve_auth(params: Mapping[str, object]) -> _Auth | _Failure:
             "GitHub Copilot model discovery requires a stored access token. Complete device-code login separately.",
         )
     requested_base: Final = params.get("api_base")
-    api_base: Final = (
-        (requested_base if isinstance(requested_base, str) and requested_base else None)
-        or authenticator.get_api_base(token)
-        or os.getenv("GITHUB_COPILOT_API_BASE")
-        or DEFAULT_GITHUB_COPILOT_API_BASE
+    api_base: Final = shared_copilot_api_base(
+        authenticator, requested_base if isinstance(requested_base, str) else None, access_token=token
     )
     return _Auth(GithubCopilotUserSession(token, api_base), "shared", credential_name, None)
 
@@ -205,12 +201,7 @@ class GithubCopilotModelInfo(BaseLLMModelInfo):
 
     @staticmethod
     def get_api_base(api_base: str | None = None) -> str:
-        return (
-            api_base
-            or Authenticator().get_api_base()
-            or os.getenv("GITHUB_COPILOT_API_BASE")
-            or DEFAULT_GITHUB_COPILOT_API_BASE
-        )
+        return shared_copilot_api_base(Authenticator(), api_base)
 
     def validate_environment(
         self,

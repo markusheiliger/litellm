@@ -27,6 +27,7 @@ from e2e_config import (
     CONTROL_PLANE_BASE_URL,
     FIXTURE_DIR,
     FIXTURE_MODE_RAW,
+    GITHUB_COPILOT_LIVE_OPT_IN_ENV,
     MANAGED_FILES_OPT_IN_ENV,
     OTEL_TLS_OPT_IN_ENV,
     OTEL_V2_OPT_IN_ENV,
@@ -76,6 +77,7 @@ OPT_IN_MARKERS: Final = MappingProxyType(
         "sagemaker_nova": SAGEMAKER_NOVA_OPT_IN_ENV,
         "sagemaker_nova2_lite": SAGEMAKER_NOVA2_LITE_OPT_IN_ENV,
         "proxy_wide_config": PROXY_WIDE_CONFIG_OPT_IN_ENV,
+        "github_copilot_live": GITHUB_COPILOT_LIVE_OPT_IN_ENV,
     }
 )
 
@@ -108,6 +110,11 @@ def jwt_identity(idp: Keycloak, resources: ResourceManager, proxy: ProxyClient) 
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "github_copilot_live: requires preconfigured Copilot accounts or an entitled GitHub App installation; "
+        "deselected unless E2E_GITHUB_COPILOT_LIVE is set",
+    )
     config.addinivalue_line(
         "markers", "migration_startup: isolated container startup tests run by the migration CI workflow"
     )

@@ -1,5 +1,4 @@
 import json
-import os
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Final, cast  # noqa: TID251  # spread dict loses the role literal without a cast
 
@@ -13,9 +12,8 @@ from litellm.llms.openai.openai import OpenAIConfig
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolCallChunk
 from litellm.types.utils import ModelResponse
 
-from ..authenticator import Authenticator
+from ..authenticator import Authenticator, shared_copilot_api_base
 from ..common_utils import (
-    DEFAULT_GITHUB_COPILOT_API_BASE,
     GetAccessTokenError,
     get_copilot_default_headers,
     pin_session_authorization,
@@ -40,12 +38,7 @@ class GithubCopilotConfig(OpenAIConfig):
         self.authenticator = Authenticator()
 
     def api_base_without_login(self, api_base: str | None = None) -> str:
-        return (
-            api_base
-            or self.authenticator.get_api_base()
-            or os.getenv("GITHUB_COPILOT_API_BASE")
-            or DEFAULT_GITHUB_COPILOT_API_BASE
-        )
+        return shared_copilot_api_base(self.authenticator, api_base)
 
     def _get_openai_compatible_provider_info(
         self,

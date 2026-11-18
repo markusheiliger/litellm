@@ -1,4 +1,9 @@
 # Other (holding pen). Grounded in litellm/proxy/auth/ + health_endpoints/ + proxy_server.py.
+- {id: other.model_discovery.github_copilot.shared.catalog_matches, module: other, tier: P1, area: model_discovery, assertions: [catalog_matches, listed_model_callable], source: "llm_translation/github_copilot/test_github_copilot_model_discovery_e2e.py"}
+- {id: other.model_discovery.github_copilot.per_user_oauth.catalog_matches, module: other, tier: P1, area: model_discovery, assertions: [catalog_matches, listed_model_callable], source: "llm_translation/github_copilot/test_github_copilot_model_discovery_e2e.py"}
+- {id: other.model_discovery.github_copilot.github_app.catalog_matches, module: other, tier: P1, area: model_discovery, assertions: [catalog_matches, listed_model_callable], source: "llm_translation/github_copilot/test_github_copilot_model_discovery_e2e.py"}
+- {id: other.model_discovery.github_copilot.per_user_oauth.caller_isolation, module: other, tier: P1, area: model_discovery, assertions: [caller_isolation], source: "llm_translation/github_copilot/test_github_copilot_model_discovery_e2e.py"}
+- {id: other.auth.github_copilot.unconnected_denied, module: other, tier: P1, area: auth, assertions: [unconnected_denied], source: "llm_translation/github_copilot/test_github_copilot_inference_e2e.py"}
 # PROMOTION NOTE: the auth cluster (~14 cells) is a candidate to promote to its own module once stable.
 - {id: other.auth.master_key.valid_allows, module: other, tier: P0, area: auth, assertions: [valid_allows], source: "user_api_key_auth.py:1569-1588", rationale: "Master key authenticates; timing-safe compare"}
 - {id: other.auth.master_key.invalid_denied, module: other, tier: P0, area: auth, assertions: [invalid_denied], source: "user_api_key_auth.py:1580", rationale: "Invalid master key rejected"}

@@ -122,6 +122,7 @@ class Provider(str, Enum):
     BEDROCK_MANTLE = "bedrock_mantle"
     AWS_POLLY = "aws_polly"
     SAIL = "sail"
+    GITHUB_COPILOT = "github_copilot"
 
 
 class Capability(str, Enum):

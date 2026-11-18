@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import respx
 
-from litellm.llms.github_copilot.authenticator import Authenticator, github_api_headers
+from litellm.llms.github_copilot.authenticator import Authenticator, github_api_headers, shared_copilot_api_base
 from litellm.llms.github_copilot.common_utils import GetAccessTokenError, GetDeviceCodeError
 
 COPILOT_USER_URL: Final = "https://api.github.com/copilot_internal/user"
@@ -105,6 +105,87 @@ def test_get_api_base_uses_user_endpoint_and_memoizes_per_access_token(
 
     assert route.call_count == 1
     assert route.calls.last.request.headers["authorization"] == f"token {token}"
+
+
+def test_shared_account_lookup_and_cache_stay_on_the_selected_host(
+    logged_in_token_dir: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, token = logged_in_token_dir
+    with respx.mock(assert_all_called=True) as router:
+        public: Final = router.get(COPILOT_USER_URL).respond(json={"endpoints": {"api": TENANT_API}})
+        enterprise: Final = router.get("https://api.test-enterprise.ghe.com/copilot_internal/user").respond(
+            json={"endpoints": {"api": "https://copilot-api.test-enterprise.ghe.com"}}
+        )
+        monkeypatch.setenv("GITHUB_COPILOT_HOST", "github.com")
+        assert Authenticator().get_api_base() == TENANT_API
+        monkeypatch.setenv("GITHUB_COPILOT_HOST", "test-enterprise.ghe.com")
+        assert Authenticator().get_api_base() == "https://copilot-api.test-enterprise.ghe.com"
+        assert Authenticator().get_api_base() == "https://copilot-api.test-enterprise.ghe.com"
+    assert public.call_count == enterprise.call_count == 1
+    assert enterprise.calls.last.request.headers["authorization"] == f"token {token}"
+
+
+def test_enterprise_device_login_ignores_public_endpoint_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_HOST", "test-enterprise.ghe.com")
+    monkeypatch.setenv("GITHUB_COPILOT_TOKEN_DIR", str(tmp_path))
+    monkeypatch.setenv("GITHUB_COPILOT_DEVICE_CODE_URL", "https://development.example/device")
+    monkeypatch.setenv("GITHUB_COPILOT_ACCESS_TOKEN_URL", "https://development.example/token")
+    with respx.mock(assert_all_called=True) as router:
+        router.post("https://test-enterprise.ghe.com/login/device/code").respond(
+            json={
+                "device_code": "synthetic-device",
+                "user_code": "TEST-CODE",
+                "verification_uri": "https://test-enterprise.ghe.com/login/device",
+            }
+        )
+        router.post("https://test-enterprise.ghe.com/login/oauth/access_token").respond(
+            json={"access_token": "enterprise-token"}
+        )
+        authenticator: Final = Authenticator()
+        device: Final = authenticator._get_device_code()
+        assert authenticator._poll_for_access_token(device["device_code"]) == "enterprise-token"
+
+
+def test_default_token_storage_never_reuses_another_hosts_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("GITHUB_COPILOT_TOKEN_DIR", raising=False)
+    legacy: Final = tmp_path / ".config/litellm/github_copilot/access-token"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("development-token")
+    monkeypatch.setenv("GITHUB_COPILOT_HOST", "first-test.ghe.com")
+    first: Final = Authenticator()
+    assert first.get_stored_access_token() is None
+    Path(first.access_token_file).write_text("first-test-token")
+    monkeypatch.setenv("GITHUB_COPILOT_HOST", "second-test.ghe.com")
+    assert Authenticator().get_stored_access_token() is None
+    monkeypatch.setenv("GITHUB_COPILOT_HOST", "first-test.ghe.com")
+    assert Authenticator().get_stored_access_token() == "first-test-token"
+    monkeypatch.setenv("GITHUB_COPILOT_HOST", "github.com")
+    assert Authenticator().get_stored_access_token() == "development-token"
+
+
+@pytest.mark.parametrize("endpoint", ("https://api.githubcopilot.com", "https://copilot-api.another-test.ghe.com"))
+def test_shared_enterprise_lookup_cannot_choose_another_tenant(
+    logged_in_token_dir: tuple[Path, str], monkeypatch: pytest.MonkeyPatch, endpoint: str
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_HOST", "test-enterprise.ghe.com")
+    with respx.mock(assert_all_called=True) as router:
+        router.get("https://api.test-enterprise.ghe.com/copilot_internal/user").respond(
+            json={"endpoints": {"api": endpoint}}
+        )
+        assert shared_copilot_api_base(Authenticator()) == "https://copilot-api.test-enterprise.ghe.com"
+
+
+def test_shared_enterprise_rejects_an_unrelated_explicit_api_base(
+    logged_in_token_dir: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GITHUB_COPILOT_HOST", "test-enterprise.ghe.com")
+    with pytest.raises(GetAccessTokenError, match="does not match GITHUB_COPILOT_HOST"):
+        shared_copilot_api_base(Authenticator(), "https://copilot-api.another-test.ghe.com")
 
 
 @pytest.mark.parametrize("status_code", [401, 403, 500])
