@@ -60,7 +60,7 @@ class TestGithubCopilotInference:
         assert all(item.embedding and all(math.isfinite(value) for value in item.embedding) for item in response.data)
         assert any(value != 0 for value in response.data[0].embedding), "The embedding vector is all zeros."
         assert response.usage.prompt_tokens > 0 and response.usage.total_tokens >= response.usage.prompt_tokens
-        assert_recorded(proxy, deployment, model)
+        assert_recorded(proxy.poll_logs_for_key(deployment.key), deployment, model)
 
     @pytest.mark.covers("other.auth.github_copilot.unconnected_denied")
     @meta(Subject(domain=Domain.PROXY_AUTH, route=Route.CHAT_COMPLETIONS, providers=(Provider.GITHUB_COPILOT,)))
@@ -121,4 +121,4 @@ def _reply(
         assert reply.response_id and reply.text.strip(), "The Copilot response returned no ID or text."
         assert reply.call_id_header, "The proxy omitted the request correlation header."
         assert reply.usage is not None and reply.usage.input_tokens > 0 and reply.usage.output_tokens > 0
-    assert_recorded(proxy, deployment, model)
+    assert_recorded(proxy.poll_logs_for_key(deployment.key), deployment, model)

@@ -2,8 +2,11 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Final
+from urllib.parse import urlparse
 
-from litellm.constants import GITHUB_COPILOT_DEFAULT_HOST
+from litellm.constants import GITHUB_COPILOT_DEFAULT_HOST, GITHUB_COPILOT_HOST_KEY
+from litellm.exceptions import BadRequestError
+from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 
 from .authenticator import (
     DEFAULT_GITHUB_ACCESS_TOKEN_URL,
@@ -76,3 +79,41 @@ def github_host_endpoints(host: str) -> GithubHostEndpoints:
         copilot_api_host_suffix=None,
         default_copilot_api_base=f"https://{copilot_api_host}",
     )
+
+
+def github_copilot_host_endpoints(credential_name: str | None) -> GithubHostEndpoints:
+    credential: Final = CredentialAccessor.find_credential(credential_name) if credential_name is not None else None
+    host_raw: Final[object] = (
+        credential.credential_values.get(GITHUB_COPILOT_HOST_KEY) if credential is not None else None
+    )
+    host: Final = normalized_github_host(host_raw)
+    if host is None:
+        raise BadRequestError(
+            message=f"Credential '{credential_name}' has an invalid {GITHUB_COPILOT_HOST_KEY}",
+            llm_provider="github_copilot",
+            model="",
+        )
+    return github_host_endpoints(host)
+
+
+def validated_copilot_api_base(endpoints_api: object, endpoints: GithubHostEndpoints) -> str:
+    if not isinstance(endpoints_api, str):
+        return endpoints.default_copilot_api_base
+    try:
+        parsed: Final = urlparse(endpoints_api)
+        port: Final = parsed.port
+    except ValueError:
+        return endpoints.default_copilot_api_base
+    hostname: Final = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme.lower() != "https"
+        or not (
+            hostname in endpoints.copilot_api_hosts
+            or (endpoints.copilot_api_host_suffix is not None and hostname.endswith(endpoints.copilot_api_host_suffix))
+        )
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        return endpoints.default_copilot_api_base
+    return endpoints_api.rstrip("/")

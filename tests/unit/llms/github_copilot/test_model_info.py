@@ -23,6 +23,7 @@ from litellm.llms.custom_httpx.http_handler import HTTPHandler
 from litellm.llms.github_copilot import app_auth
 from litellm.llms.github_copilot.app_auth import AppTokenManager
 from litellm.llms.github_copilot.chat.transformation import GithubCopilotConfig
+from litellm.llms.github_copilot.github_host import github_host_endpoints
 from litellm.llms.github_copilot.model_info import GithubCopilotModelInfo
 from litellm.llms.github_copilot.per_user_auth import attach_github_copilot_user_session
 from litellm.types.utils import CredentialItem
@@ -57,12 +58,12 @@ def user_credential(monkeypatch: pytest.MonkeyPatch) -> str:
     return "personal"
 
 
-def _user_params(name: str, user: str, token: str, *, github_host: str = "github.com") -> Mapping[str, object]:
+def _user_params(name: str, user: str, token: str, host: str = "github.com") -> Mapping[str, object]:
     return {
         "litellm_credential_name": name,
         "secret_fields": {
             "user_provider_credentials_user_id": user,
-            "user_provider_credentials": {name: {"access_token": token, "github_host": github_host}},
+            "user_provider_credentials": {name: {"access_token": token, "github_host": host}},
         },
     }
 
@@ -76,15 +77,16 @@ def _catalog_for_bearer(request: httpx.Request) -> httpx.Response:
 
 
 @pytest.mark.parametrize("mode", ["shared", "per_user_oauth", "github_app"])
-@pytest.mark.parametrize("host", ["github.com", "test-enterprise.ghe.com"])
+@pytest.mark.parametrize("host", ["github.com", "octo.ghe.com"])
 @respx.mock
 def test_catalog_and_inference_use_the_same_account_endpoint_and_integration(
     mode: str, host: str, shared_token: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("GITHUB_COPILOT_HOST", host)
-    shared_api: Final = _SHARED_API if host == "github.com" else f"https://copilot-api.{host}"
-    user_api: Final = _USER_API if host == "github.com" else f"https://copilot-api.{host}"
     requests: Final = SimpleQueue[httpx.Request]()
+    endpoints: Final = github_host_endpoints(host)
+    oauth_base: Final = (
+        endpoints.default_copilot_api_base if host != "github.com" else _SHARED_API if mode == "shared" else _USER_API
+    )
     private_key: Final = (
         rsa.generate_private_key(public_exponent=65537, key_size=2048)
         .private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
@@ -106,7 +108,7 @@ def test_catalog_and_inference_use_the_same_account_endpoint_and_integration(
                             "github_copilot_app_private_key": private_key,
                         }
                         if mode == "github_app"
-                        else {"github_copilot_auth_type": "per_user_oauth"}
+                        else {"github_copilot_auth_type": mode}
                     ),
                 },
                 credential_info={"custom_llm_provider": "github_copilot"},
@@ -128,14 +130,13 @@ def test_catalog_and_inference_use_the_same_account_endpoint_and_integration(
         if request.url.path == "/copilot_internal/user":
             return httpx.Response(
                 200,
-                json={"endpoints": {"api": shared_api if mode == "shared" else user_api}, "chat_enabled": True},
+                json={"endpoints": {"api": oauth_base}, "chat_enabled": True},
             )
         return _catalog_for_bearer(request)
 
     transport: Final = httpx.MockTransport(respond)
     if mode == "shared":
-        api: Final = "https://api.github.com" if host == "github.com" else f"https://api.{host}"
-        respx.get(f"{api}/copilot_internal/user").mock(side_effect=respond)
+        respx.get(endpoints.copilot_user_url).mock(side_effect=respond)
     with httpx.Client(transport=transport) as http_client:
         client: Final = HTTPHandler(client=http_client)
         monkeypatch.setattr(litellm, "module_level_client", client)
@@ -147,17 +148,19 @@ def test_catalog_and_inference_use_the_same_account_endpoint_and_integration(
             ),
         )
         params: Final = (
-            {}
+            {"model": "github_copilot/synthetic", "litellm_credential_name": "selected"}
             if mode == "shared"
-            else dict(_user_params("selected", "caller", f"user-{shared_token.parent.name}", github_host=host))
+            else dict(_user_params("selected", "caller", f"user-{shared_token.parent.name}", host))
         )
         info: Final = GithubCopilotModelInfo(client=client, cache=AvailableModelsCache())
         models: Final = info.discover_models(params)
         inference_params: Final = dict(params)
         attach_github_copilot_user_session(inference_params)
         config: Final = GithubCopilotConfig()
+        inference_base: Final = inference_params.get("api_base")
+        assert inference_base is None or isinstance(inference_base, str)
         provider_info: Final = (
-            config.get_openai_compatible_provider_info("synthetic", None, None, "github_copilot")
+            config.get_openai_compatible_provider_info("synthetic", inference_base, None, "github_copilot")
             if mode == "shared"
             else (None, None, "github_copilot")
         )
@@ -167,47 +170,17 @@ def test_catalog_and_inference_use_the_same_account_endpoint_and_integration(
         selected_requests: Final = tuple(requests.get_nowait() for _ in range(requests.qsize()))
         catalog_request: Final = next(request for request in selected_requests if request.url.path == "/models")
         inference_token: Final = inference_headers["Authorization"].removeprefix("Bearer ")
-        expected_base: Final = (
-            shared_api
-            if mode == "shared"
-            else user_api
-            if mode == "per_user_oauth"
-            else app_auth.AppConfig("test-client", 123, "", host=host).api_base
-        )
+        expected_base: Final = endpoints.default_copilot_api_base if mode == "github_app" else oauth_base
 
     assert models == [f"github_copilot/{inference_token}-only"]
     assert str(catalog_request.url) == f"{expected_base}/models"
+    if mode == "shared":
+        assert provider_info[0] == expected_base
     assert catalog_request.headers["authorization"] == inference_headers["Authorization"]
     assert catalog_request.headers["copilot-integration-id"] == inference_headers["copilot-integration-id"]
     assert catalog_request.headers["copilot-integration-id"] == (
         "copilot-developer-cli" if mode == "github_app" else "vscode-chat"
     )
-
-
-def test_shared_inference_and_discovery_keep_enterprise_fallbacks_on_the_same_host(
-    shared_token: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from litellm.llms.github_copilot.embedding.transformation import GithubCopilotEmbeddingConfig
-    from litellm.llms.github_copilot.messages.transformation import GithubCopilotAnthropicMessagesConfig
-    from litellm.llms.github_copilot.responses.transformation import GithubCopilotResponsesAPIConfig
-
-    monkeypatch.setenv("GITHUB_COPILOT_HOST", "test-enterprise.ghe.com")
-    monkeypatch.delenv("GITHUB_COPILOT_API_BASE", raising=False)
-    with respx.mock(assert_all_called=True) as router:
-        router.get("https://api.test-enterprise.ghe.com/copilot_internal/user").respond(503)
-        messages: Final = GithubCopilotAnthropicMessagesConfig()
-        resolved: Final = (
-            GithubCopilotModelInfo.get_api_base(),
-            GithubCopilotConfig().api_base_without_login(),
-            GithubCopilotResponsesAPIConfig().get_complete_url(None, {}),
-            GithubCopilotEmbeddingConfig().get_complete_url(None, None, "synthetic", {}, {}),
-            messages.validate_anthropic_messages_environment(
-                {}, "synthetic", [], {}, {}, api_base="https://development.example"
-            )[1],
-            messages.get_complete_url(None, None, "synthetic", {}, {}),
-        )
-    base: Final = "https://copilot-api.test-enterprise.ghe.com"
-    assert resolved == (base, base, f"{base}/responses", f"{base}/embeddings", base, f"{base}/v1/messages")
 
 
 def test_interleaved_users_rotation_and_disconnect_do_not_reuse_another_catalog(

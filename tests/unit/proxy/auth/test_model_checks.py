@@ -759,6 +759,68 @@ def test_wildcard_custom_prefix_keeps_org_segment_for_non_provider_first_segment
     assert result == ["my_hf/meta-llama/Llama-3-8B"]
 
 
+@respx.mock
+def test_wildcard_discovery_authenticates_with_the_stored_app_private_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+    from litellm import utils
+    from litellm.llms.github_copilot import app_auth
+    from litellm.proxy.auth.model_checks import get_known_models_from_wildcard
+    from litellm.types.router import LiteLLM_Params
+    from litellm.types.utils import CredentialItem
+    from litellm.utils import AvailableModelsCache
+
+    now: Final = 1_800_000_000.0
+    private_key: Final = (
+        rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        .private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+        .decode()
+    )
+    monkeypatch.setattr(litellm, "check_provider_endpoint", True)
+    monkeypatch.setattr(utils, "_model_cache", AvailableModelsCache())
+    monkeypatch.setattr(
+        litellm,
+        "credential_list",
+        [
+            CredentialItem(
+                credential_name="wildcard-app",
+                credential_info={},
+                credential_values={
+                    "github_copilot_auth_type": "github_app",
+                    "github_copilot_app_id": "test-client",
+                    "github_copilot_app_installation_id": "123",
+                    "github_copilot_app_private_key": private_key,
+                },
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        app_auth,
+        "APP_TOKEN_MANAGER",
+        app_auth.AppTokenManager(clock=lambda: now, monotonic=lambda: 0),
+    )
+    respx.post("https://api.github.com/app/installations/123/access_tokens").mock(
+        return_value=httpx.Response(
+            201,
+            json={
+                "token": "wildcard-app-token",
+                "expires_at": datetime.datetime.fromtimestamp(now + 3600, datetime.timezone.utc).isoformat(),
+                "permissions": {"organization_copilot_requests": "read"},
+            },
+        )
+    )
+    api_base: Final = app_auth.AppConfig("test-client", 123, "").api_base
+    respx.get(
+        f"{api_base}/models",
+        headers={"authorization": "Bearer wildcard-app-token", "copilot-integration-id": "copilot-developer-cli"},
+    ).mock(return_value=httpx.Response(200, json={"data": [{"id": "app-only-model"}]}))
+
+    models: Final = get_known_models_from_wildcard(
+        "github_copilot/*", LiteLLM_Params(model="github_copilot/*", litellm_credential_name="wildcard-app")
+    )
+
+    assert models == ["github_copilot/app-only-model"]
+
+
 def test_wildcard_credential_hydration_preserves_missing_credential_name(
     monkeypatch,
 ):

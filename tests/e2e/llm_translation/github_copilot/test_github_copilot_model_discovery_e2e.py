@@ -40,7 +40,7 @@ class TestGithubCopilotDiscovery:
             deployment.key, deployment.name(model), f"Say hello briefly. Request marker {unique_marker()}."
         )
         assert response.response_id and response.text.strip()
-        assert_recorded(proxy, deployment, model)
+        assert_recorded(proxy.poll_logs_for_key(deployment.key), deployment, model)
 
     @pytest.mark.covers("other.model_discovery.github_copilot.per_user_oauth.caller_isolation")
     @meta(Subject(domain=Domain.LLM_TRANSLATION, route=Route.MODEL_MANAGEMENT, providers=(Provider.GITHUB_COPILOT,)))

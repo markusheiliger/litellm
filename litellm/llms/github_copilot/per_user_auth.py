@@ -16,7 +16,6 @@ from typing import (
     TypeAlias,
     cast,  # noqa: TID251  # casts pin the untyped litellm clients/caches to the local Protocols
 )
-from urllib.parse import urlparse
 
 import httpx
 from pydantic import ConfigDict, SecretStr, TypeAdapter, ValidationError, with_config
@@ -25,7 +24,6 @@ from typing_extensions import NotRequired, ReadOnly, TypedDict
 from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.constants import (
     GITHUB_COPILOT_AUTH_TYPE_KEY,
-    GITHUB_COPILOT_HOST_KEY,
     GITHUB_COPILOT_PER_USER_AUTH_TYPE,
     GITHUB_COPILOT_USER_SESSION_TTL_SECONDS,
 )
@@ -37,9 +35,18 @@ from litellm.exceptions import (
     ServiceUnavailableError,
 )
 
-from .authenticator import github_api_headers
+from .authenticator import Authenticator, github_api_headers
 from .common_utils import get_copilot_default_headers
-from .github_host import GithubHostEndpoints, github_host_endpoints, normalized_github_host
+from .github_host import (
+    GithubHostEndpoints,
+    normalized_github_host,
+)
+from .github_host import (
+    github_copilot_host_endpoints as github_copilot_host_endpoints,
+)
+from .github_host import (
+    validated_copilot_api_base as validated_copilot_api_base,
+)
 
 GITHUB_COPILOT_USER_SESSION_KWARG_KEY: Final = "github_copilot_user_session"
 _LLM_PROVIDER: Final = "github_copilot"
@@ -182,46 +189,6 @@ class GithubCopilotDeviceFlowPoll:
     status: DeviceFlowPollStatus
     interval: int | None = None
     access_token: str | None = field(default=None, repr=False)
-
-
-def validated_copilot_api_base(endpoints_api: object, endpoints: GithubHostEndpoints) -> str:
-    if not isinstance(endpoints_api, str):
-        return endpoints.default_copilot_api_base
-    try:
-        parsed: Final = urlparse(endpoints_api)
-        port: Final = parsed.port
-    except ValueError:
-        return endpoints.default_copilot_api_base
-    hostname: Final = (parsed.hostname or "").lower()
-    if (
-        parsed.scheme.lower() != "https"
-        or not (
-            hostname in endpoints.copilot_api_hosts
-            or (endpoints.copilot_api_host_suffix is not None and hostname.endswith(endpoints.copilot_api_host_suffix))
-        )
-        or parsed.username is not None
-        or parsed.password is not None
-        or port not in (None, 443)
-    ):
-        return endpoints.default_copilot_api_base
-    return endpoints_api.rstrip("/")
-
-
-def github_copilot_host_endpoints(credential_name: str) -> GithubHostEndpoints:
-    from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
-
-    credential: Final = CredentialAccessor.find_credential(credential_name)
-    host_raw: Final[object] = (
-        credential.credential_values.get(GITHUB_COPILOT_HOST_KEY) if credential is not None else None
-    )
-    host: Final = normalized_github_host(host_raw)
-    if host is None:
-        raise BadRequestError(
-            message=f"Credential '{credential_name}' has an invalid {GITHUB_COPILOT_HOST_KEY}",
-            llm_provider=_LLM_PROVIDER,
-            model="",
-        )
-    return github_host_endpoints(host)
 
 
 def _session_cache_key(user_id: str, credential_name: str, github_host: str) -> str:
@@ -794,6 +761,28 @@ def _strip_caller_authorization(
             }
 
 
+def _shared_host_params(kwargs: Mapping[str, object]) -> tuple[str | None, str | None] | None:
+    from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+
+    model: Final = kwargs.get("model")
+    provider: Final = kwargs.get("custom_llm_provider")
+    if isinstance(model, str) and not model.startswith("github_copilot/") and provider != _LLM_PROVIDER:
+        return None
+    if isinstance(provider, str) and provider != _LLM_PROVIDER:
+        return None
+    name: Final = kwargs.get("litellm_credential_name")
+    if not isinstance(model, str) and provider != _LLM_PROVIDER:
+        credential: Final = CredentialAccessor.find_credential(name) if isinstance(name, str) else None
+        if credential is None or credential.credential_values.get(GITHUB_COPILOT_AUTH_TYPE_KEY) != "shared":
+            return None
+    return name if isinstance(name, str) else None, _requested_api_base(kwargs)
+
+
+def _requested_api_base(kwargs: Mapping[str, object]) -> str | None:
+    value: Final = kwargs.get("api_base")
+    return value if isinstance(value, str) else None
+
+
 def attach_github_copilot_user_session(
     kwargs: dict[str, object],  # mutable-ok: kwargs is the request mutation channel
 ) -> None:
@@ -808,6 +797,12 @@ def attach_github_copilot_user_session(
     credential_name_obj: Final[object] = kwargs.get("litellm_credential_name")
     auth_type_obj: Final[object] = kwargs.get(GITHUB_COPILOT_AUTH_TYPE_KEY)
     if not github_copilot_auth_mode(credential_name_obj, auth_type_obj):
+        shared_params: Final = _shared_host_params(kwargs)
+        if shared_params is not None:
+            shared_name, shared_base = shared_params
+            kwargs["api_base"] = Authenticator().resolve_api_base(  # rebind-ok: kwargs is the request mutation channel
+                shared_base, credential_name=shared_name
+            )
         return
     if isinstance(kwargs.get(GITHUB_COPILOT_USER_SESSION_KWARG_KEY), GithubCopilotUserSession):
         return
@@ -838,6 +833,12 @@ async def aattach_github_copilot_user_session(
     credential_name_obj: Final[object] = kwargs.get("litellm_credential_name")
     auth_type_obj: Final[object] = kwargs.get(GITHUB_COPILOT_AUTH_TYPE_KEY)
     if not github_copilot_auth_mode(credential_name_obj, auth_type_obj):
+        shared_params: Final = _shared_host_params(kwargs)
+        if shared_params is not None:
+            shared_name, shared_base = shared_params
+            kwargs["api_base"] = await asyncio.to_thread(  # rebind-ok: kwargs is the request mutation channel
+                Authenticator().resolve_api_base, shared_base, credential_name=shared_name
+            )
         return
     if isinstance(kwargs.get(GITHUB_COPILOT_USER_SESSION_KWARG_KEY), GithubCopilotUserSession):
         return

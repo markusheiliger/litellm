@@ -4,7 +4,7 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from queue import SimpleQueue
@@ -21,11 +21,13 @@ from llm_translation.github_copilot.support import (
     Profile,
     UpstreamTransport,
     assert_catalog_matches,
+    assert_recorded,
     copilot_base,
     load_account,
     read_secret,
     select_model,
 )
+from models import SpendLogRow
 from pydantic import BaseModel, SecretStr
 
 _ROOT: Final = Path(__file__).resolve().parents[4]
@@ -98,6 +100,42 @@ def test_catalog_comparison_accepts_only_the_full_normalized_namespace() -> None
     ):
         with pytest.raises(AssertionError):
             assert_catalog_matches(deployment, incorrect)
+
+
+@pytest.mark.parametrize(
+    ("catalog_id", "recorded_id"),
+    (
+        ("model-a", "model-a"),
+        ("model-a", "github_copilot/model-a"),
+        ("github_copilot/model-a", "model-a"),
+        ("github_copilot/model-a", "github_copilot/model-a"),
+    ),
+)
+def test_recorded_backend_matches_with_or_without_the_provider_prefix(catalog_id: str, recorded_id: str) -> None:
+    rows: Final = (SpendLogRow(status="success", custom_llm_provider="github_copilot", model=recorded_id),)
+    assert_recorded(rows, _deployment(), CatalogModel(id=catalog_id))
+
+
+@pytest.mark.parametrize("recorded_id", (None, "a", "other-model-a", "other-provider/model-a"))
+def test_recorded_backend_rejects_missing_or_different_models(recorded_id: str | None) -> None:
+    rows: Final = (SpendLogRow(status="success", custom_llm_provider="github_copilot", model=recorded_id),)
+    with pytest.raises(AssertionError, match="recorded backend"):
+        assert_recorded(rows, _deployment(), CatalogModel(id="model-a"))
+
+
+def test_recorded_request_accepts_a_stringified_unset_cache_flag() -> None:
+    rows: Final = (
+        SpendLogRow(status="success", custom_llm_provider="github_copilot", model="model-a", cache_hit="None"),
+    )
+    assert_recorded(rows, _deployment(), CatalogModel(id="model-a"))
+
+
+def test_recorded_request_rejects_a_cache_hit() -> None:
+    rows: Final = (
+        SpendLogRow(status="success", custom_llm_provider="github_copilot", model="model-a", cache_hit="True"),
+    )
+    with pytest.raises(AssertionError, match="proxy cache"):
+        assert_recorded(rows, _deployment(), CatalogModel(id="model-a"))
 
 
 @pytest.mark.parametrize(
@@ -179,7 +217,8 @@ def test_oracle_uses_only_the_selected_host_and_explicit_test_identity(
     from cryptography.hazmat.primitives.asymmetric import rsa
 
     monkeypatch.setenv("GH_HOST", "development.ghe.com")
-    monkeypatch.setenv("GITHUB_COPILOT_HOST", "development.ghe.com")
+    monkeypatch.setenv("GITHUB_COPILOT_ACCESS_TOKEN_URL", "https://development.ghe.com/login/oauth/access_token")
+    monkeypatch.setenv("GITHUB_COPILOT_API_KEY_URL", "https://api.development.ghe.com/copilot_internal/v2/token")
     monkeypatch.setenv("GITHUB_TOKEN", "development-token")
     monkeypatch.setenv("GITHUB_COPILOT_TOKEN_DIR", str(tmp_path / "development"))
     token_file: Final = tmp_path / "runner-token"
@@ -204,7 +243,10 @@ def test_oracle_uses_only_the_selected_host_and_explicit_test_identity(
         }
     )
     requests: Final = SimpleQueue[tuple[str, str, str | None]]()
-    factory: Final[Callable[[str], UpstreamTransport]] = lambda base: OracleTransport(base, payloads, requests)
+
+    def factory(base: str) -> UpstreamTransport:
+        return OracleTransport(base, payloads, requests)
+
     account: Final = load_account(
         profile,
         {

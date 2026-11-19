@@ -5,11 +5,13 @@ import datetime
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import respx
 
 import litellm
 from litellm.constants import GITHUB_COPILOT_DEFAULT_HOST, GITHUB_COPILOT_USER_SESSION_TTL_SECONDS
@@ -83,10 +85,10 @@ def github_http(respond: Callable[[httpx.Request], httpx.Response]):
     async_client = AsyncHTTPHandler(transport=httpx.MockTransport(capture))
     sync_client = HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(capture)))
     with (
+        patch("litellm.llms.github_copilot.authenticator.get_httpx_client", return_value=sync_client),
         patch("litellm.llms.custom_httpx.http_handler.get_async_httpx_client", return_value=async_client),
         patch("litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client", return_value=async_client),
         patch("litellm.llms.custom_httpx.llm_http_handler.get_httpx_client", return_value=sync_client),
-        patch("litellm.llms.github_copilot.authenticator.get_httpx_client", return_value=sync_client),
         patch.object(litellm, "module_level_client", sync_client),
     ):
         yield requests
@@ -1035,6 +1037,110 @@ async def test_e2e_anthropic_messages_not_connected_raises_connect_401(per_user_
 def _shared_login(tmp_path, monkeypatch):
     (tmp_path / "access-token").write_text("shared-copilot-token")
     monkeypatch.setenv("GITHUB_COPILOT_TOKEN_DIR", str(tmp_path))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["chat", "async_chat", "embeddings", "responses", "messages"])
+@pytest.mark.parametrize("host", ["github.com", "octo.ghe.com"])
+@respx.mock
+async def test_shared_enterprise_inference_uses_the_named_credentials_host(
+    surface: str, host: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token: Final = f"shared-{tmp_path.name}"
+    (tmp_path / "access-token").write_text(token)
+    monkeypatch.setenv("GITHUB_COPILOT_TOKEN_DIR", str(tmp_path))
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(litellm, "credential_list", [_credential("shared", host)])
+    endpoints: Final = github_host_endpoints(host)
+    api_base: Final = (
+        "https://api.account.githubcopilot.com" if host == "github.com" else endpoints.default_copilot_api_base
+    )
+    def respond(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == endpoints.copilot_user_url:
+            assert request.headers["authorization"] == f"token {token}"
+            return httpx.Response(200, json={"endpoints": {"api": api_base}})
+        if request.url.host != httpx.URL(api_base).host:
+            pytest.fail(f"Shared enterprise inference contacted the wrong host at {request.url}")
+        assert request.url.host == httpx.URL(api_base).host
+        assert request.headers["authorization"] == f"Bearer {token}"
+        match surface:
+            case "embeddings":
+                return httpx.Response(200, json=_embedding_response_payload())
+            case "responses":
+                return httpx.Response(200, json=_responses_payload())
+            case "messages":
+                return httpx.Response(200, json=_anthropic_messages_payload())
+            case _:
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "chat-shared",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "synthetic",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "tenant reply"}}],
+                        "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+                    },
+                )
+
+    respx.post(host=httpx.URL(api_base).host).mock(side_effect=respond)
+    with github_http(respond):
+        match surface:
+            case "chat":
+                assert (
+                    litellm.completion(
+                        "github_copilot/synthetic",
+                        messages=[{"role": "user", "content": "hi"}],
+                        litellm_credential_name="copilot-cred",
+                    )
+                    .choices[0]
+                    .message.content
+                    == "tenant reply"
+                )
+            case "async_chat":
+                reply: Final = await litellm.acompletion(
+                    model="github_copilot/synthetic",
+                    messages=[{"role": "user", "content": "hi"}],
+                    litellm_credential_name="copilot-cred",
+                )
+                assert reply.choices[0].message.content == "tenant reply"
+            case "embeddings":
+                assert (
+                    litellm.embedding(
+                        model="github_copilot/synthetic", input=["hi"], litellm_credential_name="copilot-cred"
+                    ).usage.prompt_tokens
+                    == 4
+                )
+            case "responses":
+                assert (
+                    litellm.responses(
+                        model="github_copilot/synthetic", input="hi", litellm_credential_name="copilot-cred"
+                    ).usage.total_tokens
+                    == 6
+                )
+            case "messages":
+                message: Final = await litellm.anthropic.messages.acreate(
+                    model=f"github_copilot/claude-synthetic-{tmp_path.name}",
+                    max_tokens=16,
+                    messages=[{"role": "user", "content": "hi"}],
+                    litellm_credential_name="copilot-cred",
+                )
+                assert message["content"][0]["text"] == "hi"
+
+
+@respx.mock
+def test_shared_unnamed_positional_chat_keeps_the_accounts_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token: Final = f"shared-positional-{tmp_path.name}"
+    (tmp_path / "access-token").write_text(token)
+    monkeypatch.setenv("GITHUB_COPILOT_TOKEN_DIR", str(tmp_path))
+    respx.get(COPILOT_USER_URL).respond(json={"endpoints": {"api": "https://api.account.githubcopilot.com"}})
+    upstream: Final = respx.post("https://api.account.githubcopilot.com/chat/completions").respond(
+        json=_chat_completion_response().model_dump()
+    )
+    litellm.completion("github_copilot/synthetic", messages=[{"role": "user", "content": "hi"}])
+    assert upstream.calls.last.request.headers["authorization"] == f"Bearer {token}"
 
 
 def test_e2e_completion_shared_mode_still_uses_authenticator(tmp_path, monkeypatch):

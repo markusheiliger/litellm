@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Literal, Protocol, TypeAlias
@@ -14,7 +14,7 @@ from _pytest.mark.structures import ParameterSet
 from e2e_http import AuthHeaders, NoBody, Result, Success, unwrap, without_retries
 from e2e_metadata import Domain, Mode, Provider, Route, Subject, meta
 from lifecycle import ResourceManager
-from models import LiteLLMParamsBody, ModelInfoBody, ModelNewBody, ModelsListParams, ModelsListResponse
+from models import LiteLLMParamsBody, ModelInfoBody, ModelNewBody, ModelsListParams, ModelsListResponse, SpendLogRow
 from proxy_client import ProxyClient
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from transport import HttpTransport
@@ -68,6 +68,7 @@ class CopilotHeaders(AuthHeaders):
 
     integration_id: str = Field(serialization_alias="copilot-integration-id")
     editor_version: str = Field(default="vscode/1.95.0", alias="editor-version")
+    api_version: str = Field(default="2025-04-01", serialization_alias="x-github-api-version")
 
 
 class GithubHeaders(AuthHeaders):
@@ -161,8 +162,32 @@ def required(environ: Mapping[str, str], name: str) -> str:
     return value
 
 
+def account_token_file(environ: Mapping[str, str], prefix: str) -> Path:
+    configured: Final = environ.get(f"E2E_GITHUB_COPILOT_{prefix}_TOKEN_FILE", "").strip()
+    if configured:
+        return Path(configured)
+    if prefix not in ("USER_A", "USER_B"):
+        return Path(required(environ, f"{prefix}_TOKEN_FILE"))
+    data_home: Final = Path(environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    if not data_home.is_absolute():
+        pytest.fail(
+            "XDG_DATA_HOME must be absolute so cached tokens stay outside the working directory.", pytrace=False
+        )
+    return (
+        data_home
+        / "litellm/copilot-e2e/tokens"
+        / configured_host(environ)
+        / prefix.lower().replace("_", "-")
+        / "access-token"
+    )
+
+
 def read_secret(environ: Mapping[str, str], name: str) -> SecretStr:
-    path: Final = Path(required(environ, name))
+    path: Final = (
+        account_token_file(environ, name.removesuffix("_TOKEN_FILE"))
+        if name in ("USER_A_TOKEN_FILE", "USER_B_TOKEN_FILE")
+        else Path(required(environ, name))
+    )
     try:
         value: Final = path.read_text(encoding="utf-8-sig").strip()
     except (OSError, UnicodeError):
@@ -217,24 +242,31 @@ def _prefix(profile: Profile) -> str:
             return "APP"
 
 
-def _app_token(github: UpstreamTransport, environ: Mapping[str, str]) -> SecretStr:
+def app_headers(environ: Mapping[str, str]) -> GithubHeaders:
     import jwt
 
     app_id: Final = required(environ, "APP_ID")
+    private_key: Final = read_secret(environ, "APP_PRIVATE_KEY_FILE")
+    now: Final = int(time.time())
+    try:
+        assertion: Final = jwt.encode(
+            {"iat": now - 60, "exp": now + 540, "iss": app_id},
+            private_key.get_secret_value(),
+            algorithm="RS256",
+        )
+    except (jwt.PyJWTError, ValueError, TypeError):
+        pytest.fail("The App RSA private key could not sign an assertion. Key details are not printed.", pytrace=False)
+    return GithubHeaders(authorization=f"Bearer {assertion}")
+
+
+def _app_token(github: UpstreamTransport, environ: Mapping[str, str]) -> SecretStr:
     installation_id: Final = required(environ, "APP_INSTALLATION_ID")
     if not installation_id.isascii() or not installation_id.isdecimal() or int(installation_id) <= 0:
         pytest.fail("E2E_GITHUB_COPILOT_APP_INSTALLATION_ID must be a positive installation ID.", pytrace=False)
-    private_key: Final = read_secret(environ, "APP_PRIVATE_KEY_FILE")
-    now: Final = int(time.time())
-    assertion: Final = jwt.encode(
-        {"iat": now - 60, "exp": now + 540, "iss": app_id},
-        private_key.get_secret_value(),
-        algorithm="RS256",
-    )
     return upstream(
         github.post(
             f"/app/installations/{installation_id}/access_tokens",
-            headers=GithubHeaders(authorization=f"Bearer {assertion}"),
+            headers=app_headers(environ),
             json=InstallationRequest(),
             response_type=InstallationToken,
         ),
@@ -420,15 +452,16 @@ def assert_catalog_matches(deployment: Deployment, actual: tuple[str, ...]) -> N
     )
 
 
-def assert_recorded(proxy: ProxyClient, deployment: Deployment, model: CatalogModel) -> None:
-    rows: Final = proxy.poll_logs_for_key(deployment.key)
+def assert_recorded(rows: Sequence[SpendLogRow], deployment: Deployment, model: CatalogModel) -> None:
     assert len(rows) == 1, f"Expected one real request for this fresh key, got {len(rows)} spend rows."
     row: Final = rows[0]
     assert row.status == "success" and row.custom_llm_provider == "github_copilot", (
         "The Copilot request was not recorded as a successful provider call."
     )
-    assert row.model and model.id.endswith(row.model), "The recorded backend differs from the selected catalog model."
-    assert row.cache_hit in (None, "False", "false"), "The inference request was served from the proxy cache."
+    assert row.model and row.model.removeprefix("github_copilot/") == model.id.removeprefix("github_copilot/"), (
+        "The recorded backend differs from the selected catalog model."
+    )
+    assert row.cache_hit in (None, "None", "False", "false"), "The inference request was served from the proxy cache."
     if deployment.account.user_id is not None:
         assert row.user == deployment.account.user_id, "The request was attributed to another LiteLLM user."
 

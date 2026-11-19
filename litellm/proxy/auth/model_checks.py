@@ -298,6 +298,8 @@ def _hydrate_litellm_credential_name(
     for key, value in credential_values.items():
         if key in _CREDENTIAL_LITELLM_PARAM_FIELDS and getattr(litellm_params, key, None) is None:
             setattr(litellm_params, key, value)
+    if litellm_params.model.startswith("github_copilot/") or litellm_params.custom_llm_provider == "github_copilot":
+        return litellm_params
     litellm_params.litellm_credential_name = None
     return litellm_params
 

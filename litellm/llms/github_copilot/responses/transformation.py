@@ -8,6 +8,7 @@ Implementation based on analysis of the copilot-api project by caozhiyuan:
 https://github.com/caozhiyuan/copilot-api
 """
 
+import os
 from collections.abc import Mapping
 from typing import (
     TYPE_CHECKING,
@@ -34,8 +35,9 @@ from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
 from litellm.utils import cached_get_model_info_helper
 
-from ..authenticator import Authenticator, shared_copilot_api_base
+from ..authenticator import Authenticator
 from ..common_utils import (
+    DEFAULT_GITHUB_COPILOT_API_BASE,
     GetAccessTokenError,
     get_copilot_default_headers,
     pin_session_authorization,
@@ -273,8 +275,12 @@ class GithubCopilotResponsesAPIConfig(OpenAIResponsesAPIConfig):
             cast("dict[str, object]", litellm_params)  # cast-ok: litellm_params arrives as an untyped request dict
         )
         effective_api_base: Final = (
-            user_session.api_base if user_session is not None else None
-        ) or shared_copilot_api_base(self.authenticator, api_base)
+            (user_session.api_base if user_session is not None else None)
+            or api_base
+            or self.authenticator.get_api_base()
+            or os.getenv("GITHUB_COPILOT_API_BASE")
+            or DEFAULT_GITHUB_COPILOT_API_BASE
+        )
 
         return join_api_base(effective_api_base, "responses")
 
