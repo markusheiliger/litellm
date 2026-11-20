@@ -21,6 +21,7 @@ from litellm.litellm_core_utils.asyncify import can_block_current_thread
 from litellm.llms.custom_httpx.http_handler import get_httpx_client
 
 from .common_utils import (
+    DEFAULT_GITHUB_CLIENT_ID,
     GetAccessTokenError,
     GetDeviceCodeError,
 )
@@ -29,7 +30,6 @@ if TYPE_CHECKING:
     from .github_host import GithubHostEndpoints
 
 # Constants (default values — overridable via environment variables at call time)
-DEFAULT_GITHUB_CLIENT_ID: Final = "Iv1.b507a08c87ecfe98"
 DEFAULT_GITHUB_DEVICE_CODE_URL: Final = "https://github.com/login/device/code"
 DEFAULT_GITHUB_ACCESS_TOKEN_URL: Final = "https://github.com/login/oauth/access_token"
 DEFAULT_GITHUB_COPILOT_USER_URL: Final = "https://api.github.com/copilot_internal/user"

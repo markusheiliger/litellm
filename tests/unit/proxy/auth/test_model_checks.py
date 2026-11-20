@@ -1406,6 +1406,22 @@ def test_add_known_models_refreshes_models_by_provider_for_wildcard_expansion():
     assert fake_model not in litellm.models_by_provider["vertex_ai"]
 
 
+@pytest.mark.parametrize("provider", ("bedrock", "bedrock_converse"))
+def test_regional_pricing_rows_do_not_narrow_bedrock_wildcard_discovery(provider: str) -> None:
+    from litellm.proxy.auth.model_checks import get_known_models_from_wildcard
+    from litellm.types.router import LiteLLM_Params
+
+    canonical: Final = "bedrock/anthropic.regional-pricing-test-v1:0"
+    regional: Final = "bedrock/us-east-1/anthropic.regional-pricing-test-v1:0"
+    with _registered_chat_models({canonical: provider, regional: provider}):
+        bare: Final = get_known_models_from_wildcard("bedrock/*", LiteLLM_Params(model="bedrock/*"))
+        routed: Final = get_known_models_from_wildcard("bedrock/*", LiteLLM_Params(model="bedrock/us-east-1/*"))
+
+    assert canonical in bare
+    assert regional not in bare
+    assert sorted(routed) == sorted(bare)
+
+
 def test_wildcard_lists_a_model_once_when_registered_both_bare_and_provider_prefixed():
     import litellm
     from litellm.proxy.auth.model_checks import get_known_models_from_wildcard
@@ -2151,7 +2167,30 @@ def test_partial_wildcard_lists_catalog_ids_stored_with_the_provider_prefix(
 
 
 @pytest.mark.parametrize(
-    ("provider", "routing_segment"), [("bedrock", "converse"), ("bedrock", "us-east-1"), ("openai", "responses")]
+    ("provider", "routing_segment"),
+    [
+        ("bedrock", "converse"),
+        ("bedrock", "us-east-1"),
+        ("bedrock", "deepseek_r1"),
+        ("openai", "responses"),
+        ("openai", "chat_completions"),
+        ("azure", "o_series"),
+        ("vertex_ai", "gemini"),
+        ("cohere", "v1"),
+        ("cohere", "v2"),
+        ("cohere_chat", "v1"),
+        ("cohere_chat", "v2"),
+        ("black_forest_labs", "unread-segment"),
+        ("aws_polly", "unread-segment"),
+        ("scaledown", "unread-segment"),
+        ("stability", "unread-segment"),
+        ("microsoft_365_copilot", "unread-segment"),
+        ("reducto", "unread-segment"),
+        ("transcribe", "unread-segment"),
+        ("azure_ai", "model_router"),
+        ("azure_ai", "model-router"),
+        ("azure_ai", "speech"),
+    ],
 )
 def test_routing_segment_lists_the_same_catalog_ids_as_the_bare_provider_wildcard(
     provider: str, routing_segment: str
@@ -2166,6 +2205,189 @@ def test_routing_segment_lists_the_same_catalog_ids_as_the_bare_provider_wildcar
 
     assert bare_listing
     assert sorted(routed_listing) == sorted(bare_listing)
+
+
+@pytest.mark.parametrize(
+    "provider",
+    [
+        "deepinfra",
+        "novita",
+        "fireworks_ai",
+        "hyperbolic",
+        "nscale",
+        "baseten",
+        "groq",
+        "sambanova",
+        "nvidia_nim",
+        "featherless_ai",
+        "anthropic",
+        "watsonx",
+        "openai",
+        "cohere",
+        "cohere_chat",
+    ],
+)
+def test_wildcard_over_an_org_the_catalog_lacks_lists_no_catalog_id(provider: str) -> None:
+    from litellm.proxy.auth.model_checks import get_known_models_from_wildcard
+    from litellm.types.router import LiteLLM_Params
+
+    with _registered_chat_models({f"{provider}/unknown-org-route-org/model-u": provider}):
+        listed_under_known_org: Final = get_known_models_from_wildcard(
+            f"{provider}/*", LiteLLM_Params(model=f"{provider}/unknown-org-route-org/*")
+        )
+        listed_under_unknown_org: Final = get_known_models_from_wildcard(
+            f"{provider}/*", LiteLLM_Params(model=f"{provider}/unknown-org-route-missing-org/*")
+        )
+
+    assert listed_under_known_org == [f"{provider}/model-u"]
+    assert listed_under_unknown_org == []
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "gemini", "fireworks_ai", "deepseek"])
+def test_wildcard_over_a_namespace_behind_a_custom_api_base_lists_the_bare_wildcard_ids(provider: str) -> None:
+    from litellm.proxy.auth.model_checks import get_known_models_from_wildcard
+    from litellm.types.router import LiteLLM_Params
+
+    with _registered_chat_models({f"{provider}/gateway-namespace-model-g": provider}):
+        bare_listing: Final = get_known_models_from_wildcard(f"{provider}/*", LiteLLM_Params(model=f"{provider}/*"))
+        behind_a_gateway: Final = get_known_models_from_wildcard(
+            f"{provider}/*",
+            LiteLLM_Params(model=f"{provider}/gateway-namespace/*", api_base="https://gateway.example.test/v1"),
+        )
+        straight_to_the_provider: Final = get_known_models_from_wildcard(
+            f"{provider}/*", LiteLLM_Params(model=f"{provider}/gateway-namespace/*")
+        )
+
+    assert f"{provider}/gateway-namespace-model-g" in bare_listing
+    assert sorted(behind_a_gateway) == sorted(bare_listing)
+    assert straight_to_the_provider == []
+
+
+@pytest.mark.parametrize(
+    ("provider", "env_var"),
+    [
+        ("openai", "OPENAI_BASE_URL"),
+        ("openai", "OPENAI_API_BASE"),
+        ("anthropic", "ANTHROPIC_BASE_URL"),
+        ("fireworks_ai", "FIREWORKS_API_BASE"),
+        ("deepseek", "DEEPSEEK_API_BASE"),
+        ("nvidia_nim", "NVIDIA_NIM_API_BASE"),
+        ("text-completion-openai", "OPENAI_BASE_URL"),
+        ("cohere_chat", "COHERE_API_BASE"),
+        ("ollama_chat", "OLLAMA_API_BASE"),
+        ("friendliai", "FRIENDLI_API_BASE"),
+        ("volcengine", "ARK_API_BASE"),
+        ("databricks", "DATABRICKS_HOST"),
+        ("deepseek", "DEEPSEEK_ANTHROPIC_API_BASE"),
+        ("tencent", "TENCENT_ANTHROPIC_API_BASE"),
+        ("mistral", "MISTRAL_AZURE_API_BASE"),
+        ("chatgpt", "OPENAI_CHATGPT_API_BASE"),
+        ("xai", "XAI_OAUTH_API_BASE"),
+        ("gradient_ai", "GRADIENT_AI_AGENT_ENDPOINT"),
+        ("datarobot", "DATAROBOT_ENDPOINT"),
+    ],
+)
+def test_wildcard_over_a_namespace_behind_a_gateway_set_in_the_env_lists_the_bare_wildcard_ids(
+    provider: str, env_var: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy.auth.model_checks import get_known_models_from_wildcard
+    from litellm.types.router import LiteLLM_Params
+
+    with _registered_chat_models({f"{provider}/env-gateway-namespace-model-g": provider}):
+        bare_listing: Final = get_known_models_from_wildcard(f"{provider}/*", LiteLLM_Params(model=f"{provider}/*"))
+        straight_to_the_provider: Final = get_known_models_from_wildcard(
+            f"{provider}/*", LiteLLM_Params(model=f"{provider}/env-gateway-namespace/*")
+        )
+        monkeypatch.setenv(env_var, "https://gateway.example.test/v1")
+        behind_a_gateway: Final = get_known_models_from_wildcard(
+            f"{provider}/*", LiteLLM_Params(model=f"{provider}/env-gateway-namespace/*")
+        )
+
+    assert straight_to_the_provider == []
+    assert bare_listing
+    assert sorted(behind_a_gateway) == sorted(bare_listing)
+
+
+def test_wildcard_over_a_namespace_behind_the_global_api_base_lists_the_bare_wildcard_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm
+    from litellm.proxy.auth.model_checks import get_known_models_from_wildcard
+    from litellm.types.router import LiteLLM_Params
+
+    with _registered_chat_models({"openai/global-gateway-namespace-model-g": "openai"}):
+        bare_listing: Final = get_known_models_from_wildcard("openai/*", LiteLLM_Params(model="openai/*"))
+        monkeypatch.setattr(litellm, "api_base", "https://gateway.example.test/v1")
+        behind_a_gateway: Final = get_known_models_from_wildcard(
+            "openai/*", LiteLLM_Params(model="openai/global-gateway-namespace/*")
+        )
+
+    assert "openai/global-gateway-namespace-model-g" in bare_listing
+    assert sorted(behind_a_gateway) == sorted(bare_listing)
+
+
+@pytest.mark.parametrize("provider", ["together_ai", "azure_ai", "watsonx"])
+def test_wildcard_over_an_unknown_org_behind_the_providers_own_api_base_lists_no_catalog_id(
+    provider: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy.auth.model_checks import get_known_models_from_wildcard
+    from litellm.types.router import LiteLLM_Params
+
+    api_base: Final = "https://tenant-resource.example.test"
+    monkeypatch.setenv(f"{provider.upper()}_API_BASE", api_base)
+    with _registered_chat_models({f"{provider}/tenant-org/model-t": provider}):
+        listed_under_known_org: Final = get_known_models_from_wildcard(
+            f"{provider}/*", LiteLLM_Params(model=f"{provider}/tenant-org/*", api_base=api_base)
+        )
+        listed_under_unknown_org: Final = get_known_models_from_wildcard(
+            f"{provider}/*", LiteLLM_Params(model=f"{provider}/tenant-missing-org/*", api_base=api_base)
+        )
+
+    assert listed_under_known_org == [f"{provider}/model-t"]
+    assert listed_under_unknown_org == []
+
+
+@pytest.mark.parametrize(
+    ("provider", "route"),
+    [
+        ("fireworks_ai", "routers"),
+        ("azure_ai", "model_router"),
+        ("azure_ai", "model-router"),
+        ("openai", "chat_completions"),
+        ("cohere", "v2"),
+        ("cohere_chat", "v2"),
+    ],
+)
+def test_wildcard_over_an_unknown_org_beneath_an_exempt_route_lists_no_catalog_id(provider: str, route: str) -> None:
+    from litellm.proxy.auth.model_checks import get_known_models_from_wildcard
+    from litellm.types.router import LiteLLM_Params
+
+    listed: Final = get_known_models_from_wildcard(
+        f"{provider}/*", LiteLLM_Params(model=f"{provider}/{route}/unknown-org-route-missing-org/*")
+    )
+
+    assert listed == []
+
+
+@pytest.mark.parametrize(
+    "route", ["routers", "firerouter", "firerouter/kimi-k3", "routers/firerouter", "routers/firerouter/kimi-k3"]
+)
+def test_fireworks_router_wildcard_lists_the_bare_wildcard_ids_except_full_resource_paths(route: str) -> None:
+    from litellm.proxy.auth.model_checks import get_known_models_from_wildcard
+    from litellm.types.router import LiteLLM_Params
+
+    resource_path_id: Final = "fireworks_ai/accounts/fireworks/models/router-route-model-r"
+    short_id: Final = "fireworks_ai/router-route-model-s"
+    with _registered_chat_models({resource_path_id: "fireworks_ai", short_id: "fireworks_ai"}):
+        bare_listing: Final = get_known_models_from_wildcard("fireworks_ai/*", LiteLLM_Params(model="fireworks_ai/*"))
+        router_listing: Final = get_known_models_from_wildcard(
+            "fireworks_ai/*", LiteLLM_Params(model=f"fireworks_ai/{route}/*")
+        )
+
+    assert {resource_path_id, short_id} <= set(bare_listing)
+    assert sorted(router_listing) == sorted(
+        listed_id for listed_id in bare_listing if not listed_id.startswith("fireworks_ai/accounts/")
+    )
 
 
 def test_provider_wildcard_lists_cost_map_models_but_not_pricing_tiers() -> None:
