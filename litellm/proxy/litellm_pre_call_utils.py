@@ -3904,7 +3904,7 @@ async def _resolve_user_provider_credentials_for_request(
     resolved_secret_fields: Final = await _get_user_provider_secret_fields(user_id, credential_names)
     if resolved_secret_fields is None:
         return
-    secret_fields.update(resolved_secret_fields)
+    secret_fields["user_provider_credentials"] = resolved_secret_fields["user_provider_credentials"]
 
 
 def _warn_stale_team_alias_once(warning_key: str, message: str, *args: str) -> None:

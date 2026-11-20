@@ -10808,7 +10808,11 @@ class TestResolveUserProviderCredentials:
 
         assert fields == {
             "user_provider_credentials": {
-                "copilot-cred": {"access_token": "gho_listing_secret", "github_host": "github.com"}
+                "copilot-cred": {
+                    "access_token": "gho_listing_secret",
+                    "github_host": "github.com",
+                    "github_login": "octo",
+                }
             },
             "user_provider_credentials_user_id": user_id,
         }
