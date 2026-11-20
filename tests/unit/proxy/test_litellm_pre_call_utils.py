@@ -10597,6 +10597,42 @@ class TestResolveUserProviderCredentials:
         assert call_where == {"AND": ({"user_id": "user-a"}, {"credential_name": {"in": ["copilot-cred"]}})}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("user_id", ["user-a", "user-b"])
+    async def test_listing_loads_only_the_authenticated_users_connection(
+        self, monkeypatch: pytest.MonkeyPatch, user_id: str
+    ) -> None:
+        from litellm.proxy.credential_endpoints import user_provider_credentials as upc
+        from litellm.proxy.litellm_pre_call_utils import get_user_provider_listing_secret_fields
+
+        monkeypatch.setattr("litellm.proxy.proxy_server.master_key", "sk-test-master")
+        table: Final = self._env(monkeypatch)
+        ciphertext: Final = upc._encode(
+            upc.GithubCopilotUserConnectionPayload(access_token="gho_listing_secret", github_login="octo")
+        )
+        table.find_many = AsyncMock(
+            return_value=[
+                SimpleNamespace(user_id=user_id, credential_name="copilot-cred", credential_b64=ciphertext)
+            ]
+        )
+        fields: Final = await get_user_provider_listing_secret_fields(
+            user_api_key_dict=UserAPIKeyAuth(user_id=user_id),
+            llm_router=self._router(),
+            model_groups=("copilot-chat",),
+            team_id=None,
+        )
+
+        assert fields == {
+            "user_provider_credentials": {
+                "copilot-cred": {"access_token": "gho_listing_secret", "github_host": "github.com"}
+            },
+            "user_provider_credentials_user_id": user_id,
+        }
+        assert "gho_listing_secret" not in repr(fields)
+        assert table.find_many.await_args.kwargs["where"] == {
+            "AND": ({"user_id": user_id}, {"credential_name": {"in": ["copilot-cred"]}})
+        }
+
+    @pytest.mark.asyncio
     async def test_service_key_cannot_override_a_per_user_credential(self, monkeypatch):
         """Keys with no user_id must still hit the body check: discovery ran before the
         missing-user return, so a litellm_credential_name override is a 400."""

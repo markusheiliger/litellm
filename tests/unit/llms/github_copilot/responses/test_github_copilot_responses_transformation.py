@@ -8,18 +8,19 @@ Source: litellm/llms/github_copilot/responses/transformation.py
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+
 import litellm
 from litellm.litellm_core_utils.get_model_cost_map import get_model_cost_map
-from litellm.types.utils import LlmProviders
-from litellm.utils import ProviderConfigManager
 from litellm.llms.github_copilot.responses.transformation import (
     GithubCopilotResponsesAPIConfig,
 )
 from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
+from litellm.types.utils import LlmProviders
+from litellm.utils import ProviderConfigManager
 
 
 @pytest.fixture(autouse=True)
@@ -364,31 +365,36 @@ class TestGithubCopilotResponsesAPIRouting:
     in the (already-merged) model info; otherwise returns None so the dispatcher
     routes through the chat-completions translation bridge."""
 
-    @patch("litellm.llms.github_copilot.responses.transformation.cached_get_model_info_helper")
-    def test_returns_config_when_mode_is_responses(self, mock_get_info):
+    def test_returns_config_when_mode_is_responses(self, monkeypatch: pytest.MonkeyPatch):
         """``mode=responses`` returns native config."""
-        mock_get_info.return_value = {"mode": "responses"}
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "github_copilot/some-responses-model",
+            {"litellm_provider": "github_copilot", "mode": "responses"},
+        )
         config = ProviderConfigManager.get_provider_responses_api_config(
             model="github_copilot/some-responses-model",
             provider=LlmProviders.GITHUB_COPILOT,
         )
         assert isinstance(config, GithubCopilotResponsesAPIConfig)
 
-    @patch("litellm.llms.github_copilot.responses.transformation.cached_get_model_info_helper")
-    def test_returns_none_when_mode_is_chat(self, mock_get_info):
+    def test_returns_none_when_mode_is_chat(self, monkeypatch: pytest.MonkeyPatch):
         """``mode=chat`` returns None so dispatcher uses bridge."""
-        mock_get_info.return_value = {"mode": "chat"}
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "github_copilot/some-chat-only-model",
+            {"litellm_provider": "github_copilot", "mode": "chat"},
+        )
         config = ProviderConfigManager.get_provider_responses_api_config(
             model="github_copilot/some-chat-only-model",
             provider=LlmProviders.GITHUB_COPILOT,
         )
         assert config is None
 
-    @patch("litellm.llms.github_copilot.responses.transformation.cached_get_model_info_helper")
-    def test_returns_none_when_mode_is_unset_and_no_endpoints(self, mock_get_info):
+    def test_returns_none_when_mode_is_unset_and_no_endpoints(self, monkeypatch: pytest.MonkeyPatch):
         """Entry without ``mode`` and without ``supported_endpoints`` returns None
         (conservative default)."""
-        mock_get_info.return_value = {}
+        monkeypatch.setitem(litellm.model_cost, "github_copilot/some-model", {"litellm_provider": "github_copilot"})
         config = ProviderConfigManager.get_provider_responses_api_config(
             model="github_copilot/some-model",
             provider=LlmProviders.GITHUB_COPILOT,
@@ -464,75 +470,73 @@ class TestGithubCopilotResponsesAPIRouting:
         )
         assert isinstance(config, GithubCopilotResponsesAPIConfig)
 
-    @patch("litellm.llms.github_copilot.responses.transformation.cached_get_model_info_helper")
-    def test_returns_none_when_get_model_info_raises(self, mock_get_info):
-        """Catalog lookup failure (model not registered) returns None
-        (conservative default; bridge handles unknown models safely)."""
-        mock_get_info.side_effect = Exception("model not in catalog")
+    def test_returns_none_for_an_unmapped_model_without_request_context(self):
         config = ProviderConfigManager.get_provider_responses_api_config(
             model="github_copilot/never-seen-model",
             provider=LlmProviders.GITHUB_COPILOT,
         )
         assert config is None
 
-    @patch("litellm.llms.github_copilot.responses.transformation.cached_get_model_info_helper")
-    def test_user_override_via_register_model(self, mock_get_info):
-        """User-supplied per-deployment ``model_info`` flows through
-        ``litellm.register_model`` (called by the router) into the merged
-        catalog read by ``_cached_get_model_info_helper``. Setting ``mode=responses``
-        for a model whose catalog entry says ``mode=chat`` therefore opts in
-        to native dispatch without any per-call argument plumbing."""
-        mock_get_info.return_value = {"mode": "responses"}
+    def test_user_override_via_register_model(self):
+        litellm.register_model(
+            {"github_copilot/some-chat-only-model": {"litellm_provider": "github_copilot", "mode": "responses"}}
+        )
         config = ProviderConfigManager.get_provider_responses_api_config(
             model="github_copilot/some-chat-only-model",
             provider=LlmProviders.GITHUB_COPILOT,
         )
         assert isinstance(config, GithubCopilotResponsesAPIConfig)
 
-    @patch("litellm.llms.github_copilot.responses.transformation.cached_get_model_info_helper")
-    def test_realistic_chat_only_entry_returns_none(self, mock_get_info):
+    def test_realistic_chat_only_entry_returns_none(self, monkeypatch: pytest.MonkeyPatch):
         """Realistic ``model_prices_and_context_window.json`` shape for a
         chat-only Copilot model (e.g. github_copilot/gemini-3.1-pro-preview)
         returns None so /v1/responses calls fall back to the bridge."""
-        mock_get_info.return_value = {
-            "litellm_provider": "github_copilot",
-            "max_input_tokens": 136000,
-            "max_output_tokens": 64000,
-            "max_tokens": 64000,
-            "mode": "chat",
-            "supported_endpoints": ["/v1/chat/completions"],
-            "supports_function_calling": True,
-            "supports_tool_choice": True,
-            "supports_parallel_function_calling": True,
-            "supports_vision": True,
-            "supports_reasoning": True,
-        }
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "github_copilot/some-chat-only-model",
+            {
+                "litellm_provider": "github_copilot",
+                "max_input_tokens": 136000,
+                "max_output_tokens": 64000,
+                "max_tokens": 64000,
+                "mode": "chat",
+                "supported_endpoints": ["/v1/chat/completions"],
+                "supports_function_calling": True,
+                "supports_tool_choice": True,
+                "supports_parallel_function_calling": True,
+                "supports_vision": True,
+                "supports_reasoning": True,
+            },
+        )
         config = ProviderConfigManager.get_provider_responses_api_config(
             model="github_copilot/some-chat-only-model",
             provider=LlmProviders.GITHUB_COPILOT,
         )
         assert config is None
 
-    @patch("litellm.llms.github_copilot.responses.transformation.cached_get_model_info_helper")
-    def test_realistic_responses_only_entry_returns_config(self, mock_get_info):
+    def test_realistic_responses_only_entry_returns_config(self, monkeypatch: pytest.MonkeyPatch):
         """Realistic catalog entry for a Responses-only Copilot model
         (e.g. github_copilot/gpt-5.5) returns the native config."""
-        mock_get_info.return_value = {
-            "litellm_provider": "github_copilot",
-            "max_input_tokens": 272000,
-            "max_output_tokens": 128000,
-            "max_tokens": 128000,
-            "mode": "responses",
-            "supported_endpoints": ["/v1/responses"],
-            "supports_function_calling": True,
-            "supports_tool_choice": True,
-            "supports_parallel_function_calling": True,
-            "supports_response_schema": True,
-            "supports_vision": True,
-            "supports_reasoning": True,
-            "supports_none_reasoning_effort": True,
-            "supports_xhigh_reasoning_effort": True,
-        }
+        monkeypatch.setitem(
+            litellm.model_cost,
+            "github_copilot/some-responses-only-model",
+            {
+                "litellm_provider": "github_copilot",
+                "max_input_tokens": 272000,
+                "max_output_tokens": 128000,
+                "max_tokens": 128000,
+                "mode": "responses",
+                "supported_endpoints": ["/v1/responses"],
+                "supports_function_calling": True,
+                "supports_tool_choice": True,
+                "supports_parallel_function_calling": True,
+                "supports_response_schema": True,
+                "supports_vision": True,
+                "supports_reasoning": True,
+                "supports_none_reasoning_effort": True,
+                "supports_xhigh_reasoning_effort": True,
+            },
+        )
         config = ProviderConfigManager.get_provider_responses_api_config(
             model="github_copilot/some-responses-only-model",
             provider=LlmProviders.GITHUB_COPILOT,

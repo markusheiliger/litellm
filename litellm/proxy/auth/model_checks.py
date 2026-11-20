@@ -15,6 +15,7 @@ from typing import Final, TypeAlias, TypeVar
 
 import litellm
 from litellm._logging import verbose_proxy_logger
+from litellm.constants import GITHUB_COPILOT_AUTH_TYPE_KEY, GITHUB_COPILOT_PER_USER_AUTH_TYPE
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.get_llm_provider_logic import inferred_provider
 from litellm.litellm_core_utils.litellm_logging import use_custom_pricing_for_model
@@ -233,6 +234,7 @@ def get_complete_model_list(
     only_model_access_groups: bool | None = False,
     team_id: str | None = None,
     expand_wildcard_routes: bool = True,
+    caller_secret_fields: Mapping[str, object] | None = None,
 ) -> list[str]:
     """Logic for returning complete model list for a given key + team pair"""
 
@@ -279,9 +281,29 @@ def get_complete_model_list(
         llm_router=llm_router,
         team_id=team_id,
         expand_wildcard_routes=expand_wildcard_routes,
+        caller_secret_fields=caller_secret_fields,
     )
 
     return list(dict.fromkeys(unique_models + all_wildcard_models))
+
+
+def _caller_discovery_params(
+    litellm_params: LiteLLM_Params | None, caller_secret_fields: Mapping[str, object] | None
+) -> LiteLLM_Params | None:
+    if litellm_params is None or caller_secret_fields is None:
+        return litellm_params
+    if litellm_params.custom_llm_provider != LlmProviders.GITHUB_COPILOT.value and not litellm_params.model.startswith(
+        "github_copilot/"
+    ):
+        return litellm_params
+    if litellm_params.litellm_credential_name is None:
+        return litellm_params
+    credential: Final = CredentialAccessor.get_credential_values(litellm_params.litellm_credential_name)
+    if not credential or credential.get(GITHUB_COPILOT_AUTH_TYPE_KEY) != GITHUB_COPILOT_PER_USER_AUTH_TYPE:
+        return litellm_params
+    from litellm.types.proxy.litellm_pre_call_utils import RedactedDict
+
+    return litellm_params.model_copy(update={"secret_fields": RedactedDict(caller_secret_fields)})
 
 
 def _hydrate_litellm_credential_name(
@@ -786,6 +808,7 @@ def expand_wildcard_deployments_for_model_info(
     deployments: list[dict[str, object]],
     llm_router: Router | None = None,
     allowed_model_names: Collection[str] | None = None,
+    caller_secret_fields: Mapping[str, object] | None = None,
 ) -> list[dict[str, object]]:
     """Expand wildcard deployments into one row per known provider model.
 
@@ -816,7 +839,7 @@ def expand_wildcard_deployments_for_model_info(
             continue
         expanded_names = get_known_models_from_wildcard(
             wildcard_model=model_name,
-            litellm_params=litellm_params,
+            litellm_params=_caller_discovery_params(litellm_params, caller_secret_fields),
             routes_to_model=_routes_to_model(routed_models, _deployment_team_id(deployment)),
             rival_patterns=rival_patterns_of_team(_deployment_team_id(deployment)),
         )
@@ -974,6 +997,7 @@ def _get_wildcard_models(
     llm_router: Router | None = None,
     team_id: str | None = None,
     expand_wildcard_routes: bool = True,
+    caller_secret_fields: Mapping[str, object] | None = None,
 ) -> list[str]:
     models_to_remove: Final = set()
     routes_to_model: Final = _routes_to_model(_cached_wildcard_routing(llm_router), team_id)
@@ -994,7 +1018,9 @@ def _get_wildcard_models(
                     all_wildcard_models.extend(
                         get_known_models_from_wildcard(
                             wildcard_model=model,
-                            litellm_params=LiteLLM_Params(**router_model["litellm_params"]),
+                            litellm_params=_caller_discovery_params(
+                                LiteLLM_Params(**router_model["litellm_params"]), caller_secret_fields
+                            ),
                             routes_to_model=routes_to_model,
                             rival_patterns=rival_patterns,
                         )

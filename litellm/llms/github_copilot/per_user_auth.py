@@ -35,18 +35,16 @@ from litellm.exceptions import (
     ServiceUnavailableError,
 )
 
+from . import github_host
 from .authenticator import Authenticator, github_api_headers
 from .common_utils import get_copilot_default_headers
 from .github_host import (
     GithubHostEndpoints,
     normalized_github_host,
 )
-from .github_host import (
-    github_copilot_host_endpoints as github_copilot_host_endpoints,
-)
-from .github_host import (
-    validated_copilot_api_base as validated_copilot_api_base,
-)
+
+github_copilot_host_endpoints: Final = github_host.github_copilot_host_endpoints
+validated_copilot_api_base: Final = github_host.validated_copilot_api_base
 
 GITHUB_COPILOT_USER_SESSION_KWARG_KEY: Final = "github_copilot_user_session"
 _LLM_PROVIDER: Final = "github_copilot"
@@ -152,11 +150,26 @@ class GithubCopilotUserSession:
     _token: SecretStr = field(repr=False)
     api_base: str
     is_app: bool = False
+    credential_name: str | None = field(default=None, repr=False)
+    user_id: str | None = field(default=None, repr=False)
+    github_host: str | None = field(default=None, repr=False)
 
-    def __init__(self, token: str, api_base: str, is_app: bool = False) -> None:
+    def __init__(
+        self,
+        token: str,
+        api_base: str,
+        is_app: bool = False,
+        *,
+        credential_name: str | None = None,
+        user_id: str | None = None,
+        github_host: str | None = None,
+    ) -> None:
         object.__setattr__(self, "_token", SecretStr(token))
         object.__setattr__(self, "api_base", api_base)
         object.__setattr__(self, "is_app", is_app)
+        object.__setattr__(self, "credential_name", credential_name)
+        object.__setattr__(self, "user_id", user_id)
+        object.__setattr__(self, "github_host", github_host)
 
     @property
     def token(self) -> str:
@@ -761,20 +774,15 @@ def _strip_caller_authorization(
             }
 
 
-def _shared_host_params(kwargs: Mapping[str, object]) -> tuple[str | None, str | None] | None:
-    from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
-
-    model: Final = kwargs.get("model")
+def _shared_host_params(kwargs: Mapping[str, object], model: str | None) -> tuple[str | None, str | None] | None:
+    effective_model: Final = model if model is not None else kwargs.get("model")
     provider: Final = kwargs.get("custom_llm_provider")
-    if isinstance(model, str) and not model.startswith("github_copilot/") and provider != _LLM_PROVIDER:
+    is_copilot_model: Final = isinstance(effective_model, str) and effective_model.startswith("github_copilot/")
+    if not is_copilot_model and provider != _LLM_PROVIDER:
         return None
     if isinstance(provider, str) and provider != _LLM_PROVIDER:
         return None
     name: Final = kwargs.get("litellm_credential_name")
-    if not isinstance(model, str) and provider != _LLM_PROVIDER:
-        credential: Final = CredentialAccessor.find_credential(name) if isinstance(name, str) else None
-        if credential is None or credential.credential_values.get(GITHUB_COPILOT_AUTH_TYPE_KEY) != "shared":
-            return None
     return name if isinstance(name, str) else None, _requested_api_base(kwargs)
 
 
@@ -783,9 +791,46 @@ def _requested_api_base(kwargs: Mapping[str, object]) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def github_copilot_scoped_session(
+    kwargs: Mapping[str, object], model: str | None = None
+) -> GithubCopilotUserSession | None:
+    from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+
+    session: Final = github_copilot_user_session_from(kwargs)
+    if (
+        session is None
+        or session.is_app
+        or not session.credential_name
+        or not session.user_id
+        or not session.github_host
+        or _shared_host_params(kwargs, model) is None
+    ):
+        return None
+    requested_name: Final = kwargs.get("litellm_credential_name")
+    if requested_name is not None and requested_name != session.credential_name:
+        return None
+    credential: Final = CredentialAccessor.find_credential(session.credential_name)
+    if credential is None or not github_copilot_auth_mode(session.credential_name, None):
+        raise _connect_error(session.credential_name)
+    endpoints: Final = github_copilot_host_endpoints(session.credential_name)
+    if endpoints.host != session.github_host:
+        raise _connect_error(session.credential_name)
+    validated_copilot_api_base(session.api_base, endpoints)
+    if requested_name is None:
+        return session if kwargs.get("secret_fields") is None else None
+    user_id, token = _caller_connection(kwargs, session.credential_name, endpoints)
+    if user_id != session.user_id or not hmac.compare_digest(token, session.token):
+        return None
+    return session
+
+
 def attach_github_copilot_user_session(
     kwargs: dict[str, object],  # mutable-ok: kwargs is the request mutation channel
+    *,
+    model: str | None = None,
 ) -> None:
+    if github_copilot_scoped_session(kwargs, model) is not None:
+        return
     from .app_auth import APP_TOKEN_MANAGER, app_config
 
     config: Final = app_config(kwargs)
@@ -797,14 +842,20 @@ def attach_github_copilot_user_session(
     credential_name_obj: Final[object] = kwargs.get("litellm_credential_name")
     auth_type_obj: Final[object] = kwargs.get(GITHUB_COPILOT_AUTH_TYPE_KEY)
     if not github_copilot_auth_mode(credential_name_obj, auth_type_obj):
-        shared_params: Final = _shared_host_params(kwargs)
+        shared_params: Final = _shared_host_params(kwargs, model)
         if shared_params is not None:
             shared_name, shared_base = shared_params
             kwargs["api_base"] = Authenticator().resolve_api_base(  # rebind-ok: kwargs is the request mutation channel
                 shared_base, credential_name=shared_name
             )
         return
-    if isinstance(kwargs.get(GITHUB_COPILOT_USER_SESSION_KWARG_KEY), GithubCopilotUserSession):
+    existing_session: Final = github_copilot_user_session_from(kwargs)
+    if (
+        existing_session is not None
+        and existing_session.credential_name is None
+        and existing_session.user_id is None
+        and existing_session.github_host is None
+    ):
         return
     credential_name: Final = credential_name_obj if isinstance(credential_name_obj, str) else ""
     endpoints: Final = github_copilot_host_endpoints(credential_name)
@@ -815,13 +866,25 @@ def attach_github_copilot_user_session(
         credential_name=credential_name,
         endpoints=endpoints,
     )
-    kwargs[GITHUB_COPILOT_USER_SESSION_KWARG_KEY] = session  # rebind-ok: kwargs is the request mutation channel
+    scoped_session: Final = GithubCopilotUserSession(
+        session.token,
+        session.api_base,
+        session.is_app,
+        credential_name=credential_name,
+        user_id=user_id,
+        github_host=endpoints.host,
+    )
+    kwargs[GITHUB_COPILOT_USER_SESSION_KWARG_KEY] = scoped_session  # rebind-ok: kwargs is the request mutation channel
     _strip_caller_authorization(kwargs)
 
 
 async def aattach_github_copilot_user_session(
     kwargs: dict[str, object],  # mutable-ok: kwargs is the request mutation channel
+    *,
+    model: str | None = None,
 ) -> None:
+    if github_copilot_scoped_session(kwargs, model) is not None:
+        return
     from .app_auth import APP_TOKEN_MANAGER, app_config
 
     config: Final = app_config(kwargs)
@@ -833,14 +896,20 @@ async def aattach_github_copilot_user_session(
     credential_name_obj: Final[object] = kwargs.get("litellm_credential_name")
     auth_type_obj: Final[object] = kwargs.get(GITHUB_COPILOT_AUTH_TYPE_KEY)
     if not github_copilot_auth_mode(credential_name_obj, auth_type_obj):
-        shared_params: Final = _shared_host_params(kwargs)
+        shared_params: Final = _shared_host_params(kwargs, model)
         if shared_params is not None:
             shared_name, shared_base = shared_params
             kwargs["api_base"] = await asyncio.to_thread(  # rebind-ok: kwargs is the request mutation channel
                 Authenticator().resolve_api_base, shared_base, credential_name=shared_name
             )
         return
-    if isinstance(kwargs.get(GITHUB_COPILOT_USER_SESSION_KWARG_KEY), GithubCopilotUserSession):
+    existing_session: Final = github_copilot_user_session_from(kwargs)
+    if (
+        existing_session is not None
+        and existing_session.credential_name is None
+        and existing_session.user_id is None
+        and existing_session.github_host is None
+    ):
         return
     credential_name: Final = credential_name_obj if isinstance(credential_name_obj, str) else ""
     endpoints: Final = github_copilot_host_endpoints(credential_name)
@@ -851,5 +920,51 @@ async def aattach_github_copilot_user_session(
         credential_name=credential_name,
         endpoints=endpoints,
     )
-    kwargs[GITHUB_COPILOT_USER_SESSION_KWARG_KEY] = session  # rebind-ok: kwargs is the request mutation channel
+    scoped_session: Final = GithubCopilotUserSession(
+        session.token,
+        session.api_base,
+        session.is_app,
+        credential_name=credential_name,
+        user_id=user_id,
+        github_host=endpoints.host,
+    )
+    kwargs[GITHUB_COPILOT_USER_SESSION_KWARG_KEY] = scoped_session  # rebind-ok: kwargs is the request mutation channel
     _strip_caller_authorization(kwargs)
+
+
+def prepare_github_copilot_request(
+    kwargs: dict[str, object],  # mutable-ok: existing SDK request mutation channel
+    *,
+    model: str | None = None,
+    call_type: str,
+    reset_model_info: bool = False,
+) -> None:
+    if reset_model_info:
+        kwargs["model_info"] = None  # rebind-ok: discard metadata belonging to the previous prompt provider
+    attach_github_copilot_user_session(kwargs, model=model)
+    if model is None or _shared_host_params(kwargs, model) is None:
+        return
+    from .model_info import prepare_github_copilot_model_info
+
+    prepared: Final = prepare_github_copilot_model_info(kwargs, model, call_type)
+    if prepared is not None:
+        kwargs["model_info"] = prepared  # rebind-ok: attach provider-owned metadata to this SDK request only
+
+
+async def aprepare_github_copilot_request(
+    kwargs: dict[str, object],  # mutable-ok: existing SDK request mutation channel
+    *,
+    model: str | None = None,
+    call_type: str,
+    reset_model_info: bool = False,
+) -> None:
+    if reset_model_info:
+        kwargs["model_info"] = None  # rebind-ok: discard metadata belonging to the previous prompt provider
+    await aattach_github_copilot_user_session(kwargs, model=model)
+    if model is None or _shared_host_params(kwargs, model) is None:
+        return
+    from .model_info import prepare_github_copilot_model_info
+
+    prepared: Final = await asyncio.to_thread(prepare_github_copilot_model_info, kwargs, model, call_type)
+    if prepared is not None:
+        kwargs["model_info"] = prepared  # rebind-ok: attach provider-owned metadata to this SDK request only

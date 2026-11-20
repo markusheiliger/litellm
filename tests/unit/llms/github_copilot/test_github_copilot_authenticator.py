@@ -4,12 +4,15 @@ from pathlib import Path
 from typing import Final
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 import respx
 
+import litellm
 from litellm.llms.github_copilot.authenticator import Authenticator, github_api_headers
 from litellm.llms.github_copilot.common_utils import GetAccessTokenError, GetDeviceCodeError
 from litellm.llms.github_copilot.github_host import github_host_endpoints
+from litellm.types.utils import CredentialItem
 
 COPILOT_USER_URL: Final = "https://api.github.com/copilot_internal/user"
 DEVICE_CODE_URL: Final = "https://github.com/login/device/code"
@@ -133,6 +136,28 @@ def test_shared_enterprise_lookup_rejects_another_hosts_endpoint(
             json={"endpoints": {"api": github_host_endpoints(returned_host).default_copilot_api_base}}
         )
         assert Authenticator().get_api_base(endpoints=endpoints) is None
+
+
+@pytest.mark.parametrize("lookup_status", [401, 503])
+def test_shared_enterprise_lookup_failure_keeps_the_configured_tenant(
+    logged_in_token_dir: tuple[Path, str], monkeypatch: pytest.MonkeyPatch, lookup_status: int
+) -> None:
+    endpoints: Final = github_host_endpoints("octo.ghe.com")
+    monkeypatch.delenv("GITHUB_COPILOT_API_BASE", raising=False)
+    monkeypatch.setattr(
+        litellm,
+        "credential_list",
+        [
+            CredentialItem(
+                credential_name="enterprise",
+                credential_values={"github_copilot_auth_type": "shared", "github_copilot_host": endpoints.host},
+                credential_info={"custom_llm_provider": "github_copilot"},
+            )
+        ],
+    )
+    with respx.mock(assert_all_called=True) as router:
+        router.get(endpoints.copilot_user_url).mock(return_value=httpx.Response(lookup_status))
+        assert Authenticator().resolve_api_base(credential_name="enterprise") == endpoints.default_copilot_api_base
 
 
 @pytest.mark.parametrize("status_code", [401, 403, 500])

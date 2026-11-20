@@ -3,15 +3,17 @@
 import asyncio
 import datetime
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Final
+from queue import SimpleQueue
+from typing import Final, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 import respx
+from pydantic import TypeAdapter
 
 import litellm
 from litellm.constants import GITHUB_COPILOT_DEFAULT_HOST, GITHUB_COPILOT_USER_SESSION_TTL_SECONDS
@@ -42,7 +44,8 @@ from litellm.llms.github_copilot.per_user_auth import (
     resolve_copilot_user_session,
     validated_copilot_api_base,
 )
-from litellm.types.utils import CredentialItem, ModelResponse
+from litellm.types.llms.openai import ResponsesAPIResponse
+from litellm.types.utils import Choices, CredentialItem, EmbeddingResponse, ModelResponse
 
 COPILOT_USER_URL = "https://api.github.com/copilot_internal/user"
 DEVICE_CODE_URL = "https://github.com/login/device/code"
@@ -217,7 +220,13 @@ def test_invalid_stored_host_fails_before_user_lookup():
 
 
 def test_session_repr_and_str_hide_the_token(caplog):
-    session = GithubCopilotUserSession(token="secret-copilot-token", api_base="https://api.githubcopilot.com")
+    session = GithubCopilotUserSession(
+        token="secret-copilot-token",
+        api_base="https://api.githubcopilot.com",
+        credential_name="private-credential",
+        user_id="private-caller",
+        github_host="private.ghe.com",
+    )
     assert "secret-copilot-token" not in repr(session)
     assert "secret-copilot-token" not in str(session)
     with caplog.at_level("DEBUG"):
@@ -225,6 +234,7 @@ def test_session_repr_and_str_hide_the_token(caplog):
 
         logging.getLogger("litellm").debug("session: %s", session)
     assert "secret-copilot-token" not in caplog.text
+    assert all(value not in caplog.text for value in ("private-credential", "private-caller", "private.ghe.com"))
 
 
 def test_user_lookup_returns_github_token_and_caches_per_user():
@@ -613,11 +623,9 @@ def test_is_github_copilot_per_user_request():
     assert is_github_copilot_per_user_request({"litellm_credential_name": "copilot-cred"}) is False
 
 
-def _chat_completion_response():
-    from litellm.utils import convert_to_model_response_object
-
-    return convert_to_model_response_object(
-        response_object={
+def _chat_completion_response() -> ModelResponse:
+    return ModelResponse(
+        **{
             "id": "chatcmpl-1",
             "object": "chat.completion",
             "created": 1,
@@ -625,7 +633,6 @@ def _chat_completion_response():
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
         },
-        model_response_object=ModelResponse(),
     )
 
 
@@ -639,6 +646,165 @@ def _secret_fields(user_id: str, github_token: str):
             }
         },
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["sync", "async"])
+@respx.mock
+async def test_concurrent_callers_route_the_same_unmapped_model_from_their_own_catalog(
+    per_user_credential: object, monkeypatch: pytest.MonkeyPatch, surface: Literal["sync", "async"]
+) -> None:
+    from litellm import utils
+    from litellm.utils import AvailableModelsCache
+
+    monkeypatch.setattr(utils, "_model_cache", AvailableModelsCache())
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    dispatched: Final = SimpleQueue[tuple[str, str]]()
+    model: Final = "concurrent-synthetic"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        token: Final = request.headers["authorization"].split(" ", 1)[1]
+        if request.url.path == "/copilot_internal/user":
+            return httpx.Response(200, json=_user_payload())
+        if request.url.path == "/models":
+            endpoint: Final = "/responses" if token.endswith("responses") else "/chat/completions"
+            return httpx.Response(200, json={"data": [{"id": model, "supported_endpoints": [endpoint]}]})
+        dispatched.put((token, request.url.path))
+        if request.url.path == "/responses":
+            return httpx.Response(200, json=_responses_payload())
+        assert request.url.path == "/chat/completions"
+        return httpx.Response(
+            200,
+            json={
+                "id": "chat-concurrent",
+                "object": "chat.completion",
+                "created": 1,
+                "model": model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "chat reply"}}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+            },
+        )
+
+    async def reply(user: str) -> str:
+        parameters: Final = {
+            "model": f"github_copilot/{model}",
+            "messages": [{"role": "user", "content": "hi"}],
+            "litellm_credential_name": "copilot-cred",
+            "secret_fields": _secret_fields(user, f"concurrent-{user}"),
+        }
+        response: Final = (
+            await asyncio.to_thread(litellm.completion, **parameters)
+            if surface == "sync"
+            else await litellm.acompletion(**parameters)
+        )
+        assert isinstance(response, ModelResponse)
+        choice: Final = response.choices[0]
+        assert isinstance(choice, Choices)
+        assert isinstance(choice.message.content, str)
+        return choice.message.content
+
+    respx.post(host="api.githubcopilot.com").mock(side_effect=respond)
+    with github_http(respond):
+        assert await asyncio.gather(reply("chat"), reply("responses")) == ["chat reply", "hi"]
+    assert frozenset(dispatched.get_nowait() for _ in range(dispatched.qsize())) == {
+        ("concurrent-chat", "/chat/completions"),
+        ("concurrent-responses", "/responses"),
+    }
+
+
+def _bridged_per_user_request(session: object) -> dict[str, object]:
+    return {
+        "model": "github_copilot/synthetic",
+        "github_copilot_auth_type": "per_user_oauth",
+        GITHUB_COPILOT_USER_SESSION_KWARG_KEY: session,
+    }
+
+
+@pytest.mark.parametrize("change", ["removed", "shared", "host"])
+def test_bridged_session_cannot_override_changed_credential_configuration(
+    change: str, per_user_credential: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with github_http(_user_responder()) as requests:
+        original: Final = _kwargs_with_connection()
+        attach_github_copilot_user_session(original)
+        incoming: Final = _bridged_per_user_request(original[GITHUB_COPILOT_USER_SESSION_KWARG_KEY])
+        monkeypatch.setattr(
+            litellm,
+            "credential_list",
+            []
+            if change == "removed"
+            else [_credential("shared" if change == "shared" else "per_user_oauth", "other.ghe.com")],
+        )
+        with pytest.raises(CallerCredentialAuthenticationError):
+            attach_github_copilot_user_session(incoming)
+    assert len(requests) == 1
+
+
+def test_session_json_and_prepared_capabilities_do_not_authorize_inference(
+    per_user_credential: object,
+) -> None:
+    from litellm.llms.github_copilot.per_user_auth import prepare_github_copilot_request
+
+    incoming: Final = {
+        **_bridged_per_user_request(
+            {
+                "token": "forged-token",
+                "api_base": "https://api.githubcopilot.com",
+                "credential_name": "copilot-cred",
+                "user_id": "user-a",
+                "github_host": "github.com",
+            }
+        ),
+        "model_info": {"github_copilot": {"model": "github_copilot/synthetic", "info": {"mode": "responses"}}},
+    }
+    with github_http(lambda request: pytest.fail(f"Unauthorized request reached {request.url}")) as requests:
+        with pytest.raises(BadRequestError):
+            prepare_github_copilot_request(incoming, model="github_copilot/synthetic", call_type="completion")
+    assert not requests
+
+
+def test_attached_session_does_not_hide_disconnect_or_token_rotation(per_user_credential: object) -> None:
+    with github_http(_user_responder()):
+        original: Final = _kwargs_with_connection()
+        attach_github_copilot_user_session(original)
+        session: Final = original[GITHUB_COPILOT_USER_SESSION_KWARG_KEY]
+        disconnected: Final = {
+            **original,
+            "secret_fields": {"user_provider_credentials_user_id": "user-a", "user_provider_credentials": {}},
+        }
+        with pytest.raises(CallerCredentialAuthenticationError):
+            attach_github_copilot_user_session(disconnected)
+        rotated: Final = {
+            **_kwargs_with_connection(token="rotated-token"),
+            GITHUB_COPILOT_USER_SESSION_KWARG_KEY: session,
+        }
+        attach_github_copilot_user_session(rotated)
+        current: Final = github_copilot_user_session_from(rotated)
+        assert current is not None
+        assert current.token == "rotated-token"
+
+
+@respx.mock
+def test_existing_unscoped_sdk_session_still_authenticates_chat(per_user_credential: object) -> None:
+    session: Final = GithubCopilotUserSession("legacy-sdk-token", "https://api.githubcopilot.com")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/chat/completions"
+        assert request.headers["authorization"] == f"Bearer {session.token}"
+        return httpx.Response(200, json=_chat_completion_response().model_dump())
+
+    respx.post(host="api.githubcopilot.com").mock(side_effect=respond)
+    with github_http(respond):
+        response: Final = litellm.completion(
+            model="github_copilot/legacy-synthetic",
+            model_info={"mode": "chat"},
+            messages=[{"role": "user", "content": "hi"}],
+            litellm_credential_name="copilot-cred",
+            github_copilot_user_session=session,
+        )
+    assert isinstance(response, ModelResponse)
+    assert isinstance(response.choices[0], Choices)
+    assert response.choices[0].message.content == "hello"
 
 
 def test_two_per_user_calls_with_identical_bodies_both_reach_upstream(  # test-quality-ok: upstream dispatch count is the observable signal of the cache exclusion
@@ -1042,9 +1208,14 @@ def _shared_login(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["chat", "async_chat", "embeddings", "responses", "messages"])
 @pytest.mark.parametrize("host", ["github.com", "octo.ghe.com"])
+@pytest.mark.parametrize("routing", ["chat", "responses"])
 @respx.mock
 async def test_shared_enterprise_inference_uses_the_named_credentials_host(
-    surface: str, host: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    surface: Literal["chat", "async_chat", "embeddings", "responses", "messages"],
+    host: str,
+    routing: Literal["chat", "responses"],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     token: Final = f"shared-{tmp_path.name}"
     (tmp_path / "access-token").write_text(token)
@@ -1055,6 +1226,8 @@ async def test_shared_enterprise_inference_uses_the_named_credentials_host(
     api_base: Final = (
         "https://api.account.githubcopilot.com" if host == "github.com" else endpoints.default_copilot_api_base
     )
+    upstream_paths: Final = SimpleQueue[str]()
+
     def respond(request: httpx.Request) -> httpx.Response:
         if str(request.url) == endpoints.copilot_user_url:
             assert request.headers["authorization"] == f"token {token}"
@@ -1063,11 +1236,24 @@ async def test_shared_enterprise_inference_uses_the_named_credentials_host(
             pytest.fail(f"Shared enterprise inference contacted the wrong host at {request.url}")
         assert request.url.host == httpx.URL(api_base).host
         assert request.headers["authorization"] == f"Bearer {token}"
+        if request.url.path == "/models":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "synthetic",
+                            "supported_endpoints": ["/responses" if routing == "responses" else "/chat/completions"],
+                        }
+                    ]
+                },
+            )
+        upstream_paths.put(request.url.path)
+        if request.url.path == "/responses":
+            return httpx.Response(200, json=_responses_payload())
         match surface:
             case "embeddings":
                 return httpx.Response(200, json=_embedding_response_payload())
-            case "responses":
-                return httpx.Response(200, json=_responses_payload())
             case "messages":
                 return httpx.Response(200, json=_anthropic_messages_payload())
             case _:
@@ -1087,59 +1273,160 @@ async def test_shared_enterprise_inference_uses_the_named_credentials_host(
     with github_http(respond):
         match surface:
             case "chat":
-                assert (
-                    litellm.completion(
-                        "github_copilot/synthetic",
-                        messages=[{"role": "user", "content": "hi"}],
-                        litellm_credential_name="copilot-cred",
-                    )
-                    .choices[0]
-                    .message.content
-                    == "tenant reply"
+                chat: Final = litellm.completion(
+                    "github_copilot/synthetic",
+                    messages=[{"role": "user", "content": "hi"}],
+                    litellm_credential_name="copilot-cred",
                 )
+                assert isinstance(chat, ModelResponse)
+                assert isinstance(chat.choices[0], Choices)
+                assert chat.choices[0].message.content == ("hi" if routing == "responses" else "tenant reply")
             case "async_chat":
                 reply: Final = await litellm.acompletion(
                     model="github_copilot/synthetic",
                     messages=[{"role": "user", "content": "hi"}],
                     litellm_credential_name="copilot-cred",
                 )
-                assert reply.choices[0].message.content == "tenant reply"
+                assert isinstance(reply, ModelResponse)
+                assert isinstance(reply.choices[0], Choices)
+                assert reply.choices[0].message.content == ("hi" if routing == "responses" else "tenant reply")
             case "embeddings":
-                assert (
-                    litellm.embedding(
-                        model="github_copilot/synthetic", input=["hi"], litellm_credential_name="copilot-cred"
-                    ).usage.prompt_tokens
-                    == 4
+                embedding: Final = litellm.embedding(
+                    model="github_copilot/synthetic", input=["hi"], litellm_credential_name="copilot-cred"
                 )
+                assert isinstance(embedding, EmbeddingResponse)
+                assert embedding.usage is not None
+                assert embedding.usage.prompt_tokens == 4
             case "responses":
-                assert (
-                    litellm.responses(
-                        model="github_copilot/synthetic", input="hi", litellm_credential_name="copilot-cred"
-                    ).usage.total_tokens
-                    == 6
+                response: Final = litellm.responses(
+                    model="github_copilot/synthetic", input="hi", litellm_credential_name="copilot-cred"
                 )
+                assert isinstance(response, ResponsesAPIResponse)
+                assert response.usage is not None
+                assert response.usage.total_tokens == 6
             case "messages":
-                message: Final = await litellm.anthropic.messages.acreate(
+                message: Final[object] = await litellm.anthropic.messages.acreate(
                     model=f"github_copilot/claude-synthetic-{tmp_path.name}",
                     max_tokens=16,
                     messages=[{"role": "user", "content": "hi"}],
                     litellm_credential_name="copilot-cred",
                 )
-                assert message["content"][0]["text"] == "hi"
+                payload: Final = TypeAdapter(Mapping[str, object]).validate_python(message)
+                assert payload["content"] == [{"type": "text", "text": "hi"}]
+    if surface in ("chat", "async_chat", "responses"):
+        expected_path: Final = "/responses" if routing == "responses" else "/chat/completions"
+        assert tuple(upstream_paths.get_nowait() for _ in range(upstream_paths.qsize())) == (expected_path,)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_call", [False, True])
 @respx.mock
-def test_shared_unnamed_positional_chat_keeps_the_accounts_endpoint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_shared_unnamed_positional_chat_keeps_the_accounts_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_call: bool
 ) -> None:
     token: Final = f"shared-positional-{tmp_path.name}"
     (tmp_path / "access-token").write_text(token)
     monkeypatch.setenv("GITHUB_COPILOT_TOKEN_DIR", str(tmp_path))
-    respx.get(COPILOT_USER_URL).respond(json={"endpoints": {"api": "https://api.account.githubcopilot.com"}})
-    upstream: Final = respx.post("https://api.account.githubcopilot.com/chat/completions").respond(
-        json=_chat_completion_response().model_dump()
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    respx.get(COPILOT_USER_URL).mock(
+        return_value=httpx.Response(200, json={"endpoints": {"api": "https://api.account.githubcopilot.com"}})
     )
-    litellm.completion("github_copilot/synthetic", messages=[{"role": "user", "content": "hi"}])
+    respx.get("https://api.account.githubcopilot.com/models").respond(
+        200, json={"data": [{"id": "synthetic", "supported_endpoints": ["/chat/completions"]}]}
+    )
+    upstream: Final = respx.post("https://api.account.githubcopilot.com/chat/completions").mock(
+        return_value=httpx.Response(200, content=_chat_completion_response().model_dump_json())
+    )
+    if async_call:
+        await litellm.acompletion("github_copilot/synthetic", messages=[{"role": "user", "content": "hi"}])
+    else:
+        litellm.completion("github_copilot/synthetic", messages=[{"role": "user", "content": "hi"}])
+    assert upstream.calls.last.request.headers["authorization"] == f"Bearer {token}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_call", [False, True])
+@pytest.mark.parametrize("positional", [False, True])
+@respx.mock
+async def test_other_provider_requests_do_not_use_copilot_host_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_call: bool, positional: bool
+) -> None:
+    _shared_login(tmp_path, monkeypatch)
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(litellm, "credential_list", [_credential("shared", "octo.ghe.com")])
+    upstream: Final = respx.post("https://api.openai.com/v1/chat/completions").mock(
+        return_value=httpx.Response(200, content=_chat_completion_response().model_dump_json())
+    )
+    args: Final = ("openai/synthetic",) if positional else ()
+    kwargs: Final = {
+        "api_key": "test-provider-key",
+        "litellm_credential_name": "copilot-cred",
+        **({} if positional else {"model": "openai/synthetic"}),
+    }
+    if async_call:
+        response: Final = await litellm.acompletion(*args, messages=[{"role": "user", "content": "hi"}], **kwargs)
+        assert isinstance(response, ModelResponse)
+        assert isinstance(response.choices[0], Choices)
+        assert response.choices[0].message.content == "hello"
+    else:
+        sync_response: Final = litellm.completion(*args, messages=[{"role": "user", "content": "hi"}], **kwargs)
+        assert isinstance(sync_response, ModelResponse)
+        assert isinstance(sync_response.choices[0], Choices)
+        assert sync_response.choices[0].message.content == "hello"
+    assert upstream.calls.last.request.headers["authorization"] == "Bearer test-provider-key"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+@respx.mock
+async def test_shared_enterprise_wildcard_router_keeps_the_credentials_host(
+    surface: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token: Final = f"shared-router-{tmp_path.name}"
+    (tmp_path / "access-token").write_text(token)
+    monkeypatch.setenv("GITHUB_COPILOT_TOKEN_DIR", str(tmp_path))
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(litellm, "credential_list", [_credential("shared", "octo.ghe.com")])
+    endpoints: Final = github_host_endpoints("octo.ghe.com")
+    model: Final = f"synthetic-{tmp_path.name}"
+    monkeypatch.setattr(litellm, "model_cost", dict(litellm.model_cost))
+    litellm.register_model({f"github_copilot/{model}": {"mode": surface if surface == "responses" else "chat"}})
+    respx.get(endpoints.copilot_user_url).mock(
+        return_value=httpx.Response(200, json={"endpoints": {"api": endpoints.default_copilot_api_base}})
+    )
+    upstream: Final = respx.post(
+        f"{endpoints.default_copilot_api_base}/{'responses' if surface == 'responses' else 'chat/completions'}"
+    ).mock(
+        return_value=(
+            httpx.Response(200, json=_responses_payload())
+            if surface == "responses"
+            else httpx.Response(200, content=_chat_completion_response().model_dump_json())
+        )
+    )
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": "copilot/*",
+                "litellm_params": {"model": "github_copilot/*", "litellm_credential_name": "copilot-cred"},
+            }
+        ],
+        num_retries=0,
+    )
+    try:
+        if surface == "responses":
+            response: Final = await router.aresponses(model=f"copilot/{model}", input="hi")
+            assert isinstance(response, ResponsesAPIResponse)
+            assert response.usage is not None
+            assert response.usage.total_tokens == 6
+        else:
+            chat: Final = await router.acompletion(
+                model=f"copilot/{model}", messages=[{"role": "user", "content": "hi"}]
+            )
+            assert isinstance(chat, ModelResponse)
+            assert isinstance(chat.choices[0], Choices)
+            assert chat.choices[0].message.content == "hello"
+    finally:
+        router.reset()
     assert upstream.calls.last.request.headers["authorization"] == f"Bearer {token}"
 
 

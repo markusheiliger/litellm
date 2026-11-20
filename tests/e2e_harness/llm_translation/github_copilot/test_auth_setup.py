@@ -31,7 +31,7 @@ def test_missing_browser_reports_the_failed_stage_without_exposing_private_paths
     e2e: Final = Path(__file__).resolve().parents[4] / "tests/e2e"
     private_path: Final = tmp_path / "private-browser-path"
     result: Final = subprocess.run(
-        [sys.executable, str(e2e / "llm_translation/github_copilot/runner.py"), "--auth"],
+        [sys.executable, "-P", str(e2e / "llm_translation/github_copilot/runner.py"), "--auth"],
         cwd=tmp_path,
         env={
             **os.environ,

@@ -158,6 +158,10 @@ def responses_api_bridge_check(
     api_base: str | None = None,
     deployment_model_info: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], str]:
+    if custom_llm_provider == "github_copilot":
+        from litellm.llms.github_copilot.responses.transformation import github_copilot_chat_bridge_check
+
+        return github_copilot_chat_bridge_check(model, deployment_model_info)
     model_info: dict[str, object] = {}
 
     # Global flag: route ALL OpenAI chat completions through Responses API.

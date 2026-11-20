@@ -505,7 +505,9 @@ def test_hosted_vllm_wildcard_sends_the_configured_api_key_as_a_bearer_token(mon
 
 
 @respx.mock
-def test_hosted_vllm_wildcard_without_api_base_lists_the_server_chat_would_call(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_hosted_vllm_wildcard_without_api_base_lists_the_server_chat_would_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import litellm
     from litellm.proxy.auth.model_checks import get_known_models_from_wildcard
     from litellm.types.router import LiteLLM_Params
@@ -577,7 +579,6 @@ def test_hosted_vllm_wildcard_listing_sends_the_deployment_extra_headers(monkeyp
     assert listed == ["hosted_vllm/qwen2.5"]
 
 
-
 @respx.mock
 def test_vllm_wildcard_never_lists_the_ids_of_a_configured_vllm_server(monkeypatch: pytest.MonkeyPatch) -> None:
     import litellm
@@ -598,6 +599,7 @@ def test_vllm_wildcard_never_lists_the_ids_of_a_configured_vllm_server(monkeypat
 
     assert "vllm/model-only-a-server-serves" not in listed
     assert not server_route.called
+
 
 _SELF_SIGNED_CERT_NOT_VALID_BEFORE: Final = datetime.datetime(2000, 1, 1, tzinfo=datetime.UTC)
 _SELF_SIGNED_CERT_NOT_VALID_AFTER: Final = datetime.datetime(9999, 12, 31, tzinfo=datetime.UTC)
@@ -757,6 +759,85 @@ def test_wildcard_custom_prefix_keeps_org_segment_for_non_provider_first_segment
     )
 
     assert result == ["my_hf/meta-llama/Llama-3-8B"]
+
+
+@respx.mock
+@pytest.mark.parametrize("listing", ["names", "model_info"])
+def test_copilot_wildcard_catalog_uses_only_the_callers_connection(
+    listing: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import litellm
+    from litellm import utils
+    from litellm.exceptions import AuthenticationError
+    from litellm.proxy.auth.model_checks import (
+        expand_wildcard_deployments_for_model_info,
+        get_complete_model_list,
+    )
+    from litellm.types.utils import CredentialItem
+    from litellm.utils import AvailableModelsCache
+
+    monkeypatch.setattr(litellm, "check_provider_endpoint", True)
+    monkeypatch.setattr(utils, "_model_cache", AvailableModelsCache())
+    monkeypatch.setattr(
+        litellm,
+        "credential_list",
+        [
+            CredentialItem(
+                credential_name="listing-personal",
+                credential_info={},
+                credential_values={"github_copilot_auth_type": "per_user_oauth"},
+            )
+        ],
+    )
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "personal/*",
+                "litellm_params": {
+                    "model": "github_copilot/*",
+                    "litellm_credential_name": "listing-personal",
+                },
+            }
+        ]
+    )
+    respx.get("https://api.github.com/copilot_internal/user").mock(
+        return_value=httpx.Response(200, json={"endpoints": {"api": "https://api.listing.githubcopilot.com"}})
+    )
+
+    def catalog(request: httpx.Request) -> httpx.Response:
+        token: Final = request.headers["authorization"].removeprefix("Bearer ")
+        return httpx.Response(200, json={"data": [{"id": f"only-{token.removeprefix('token-')}"}]})
+
+    respx.get("https://api.listing.githubcopilot.com/models").mock(side_effect=catalog)
+
+    def listed_models(secret_fields: Mapping[str, object]) -> list[str]:
+        if listing == "names":
+            return get_complete_model_list(
+                key_models=["personal/*"],
+                team_models=(),
+                proxy_model_list=router.registry().names(),
+                user_model=None,
+                infer_model_from_keys=False,
+                llm_router=router,
+                caller_secret_fields=secret_fields,
+            )
+        rows: Final = expand_wildcard_deployments_for_model_info(
+            list(router.registry().all()), router, caller_secret_fields=secret_fields
+        )
+        assert "token-" not in json.dumps(rows)
+        return [str(row["model_name"]) for row in rows]
+
+    for user in ("a", "b"):
+        assert listed_models(
+            {
+                "user_provider_credentials_user_id": user,
+                "user_provider_credentials": {
+                    "listing-personal": {"access_token": f"token-{user}", "github_host": "github.com"}
+                },
+            }
+        ) == [f"personal/only-{user}"]
+    with pytest.raises(AuthenticationError):
+        listed_models({"user_provider_credentials_user_id": "unconnected", "user_provider_credentials": {}})
 
 
 @respx.mock
@@ -1173,7 +1254,6 @@ def test_expand_wildcard_invalid_litellm_params_passthrough():
     assert result == [deployment]
 
 
-
 @pytest.mark.parametrize(
     ("allowed_model_names", "expected_names", "expected_listings"),
     [
@@ -1222,6 +1302,7 @@ def test_expand_wildcard_alias_over_one_model_is_kept_only_for_keys_with_a_name_
     rows: Final = expand_wildcard_deployments_for_model_info([deployment], allowed_model_names=allowed_model_names)
 
     assert rows == ([deployment] if keeps_the_alias else [])
+
 
 def test_get_complete_model_list_excludes_wildcard_routes_by_default():
     """Regression (LIT-4108): a wildcard with a matching router deployment leaked into /v1/models."""
@@ -2400,9 +2481,13 @@ def test_slashless_wildcard_over_a_bare_deployment_lists_its_custom_llm_provider
     model_info_rows: Final = expand_wildcard_deployments_for_model_info(
         [dict(deployment) for deployment in router.get_model_list() or []], router
     )
-    openai_ids: Final = frozenset(model.removeprefix("openai/") for model in get_valid_models(custom_llm_provider="openai"))
+    openai_ids: Final = frozenset(
+        model.removeprefix("openai/") for model in get_valid_models(custom_llm_provider="openai")
+    )
     routed_models: Final = {
-        listed_id: [deployment["litellm_params"]["model"] for deployment in router.wildcard_route_deployments(listed_id, None)]
+        listed_id: [
+            deployment["litellm_params"]["model"] for deployment in router.wildcard_route_deployments(listed_id, None)
+        ]
         for listed_id in v1_models
     }
 

@@ -757,6 +757,7 @@ from litellm.proxy.litellm_pre_call_utils import (
     SCHEDULER_PRIORITY_HEADER,
     LiteLLMProxyRequestSetup,
     add_litellm_data_to_request,
+    get_user_provider_listing_secret_fields,
     sanitize_for_log,
 )
 from litellm.proxy.logging_endpoints.callback_logs_endpoints import (
@@ -13146,6 +13147,9 @@ async def model_list(
                 model_access_groups=model_access_groups,
                 include_model_access_groups=include_model_access_groups or False,
                 only_model_access_groups=only_model_access_groups or False,
+                caller_secret_fields=await get_user_provider_listing_secret_fields(
+                    user_api_key_dict, llm_router, proxy_model_list, None
+                ),
             )
         )
 
@@ -19083,6 +19087,12 @@ async def model_info_v1(
             all_models,
             llm_router,
             allowed_model_names=allowed_model_names,
+            caller_secret_fields=await get_user_provider_listing_secret_fields(
+                user_api_key_dict,
+                llm_router,
+                allowed_model_names if allowed_model_names is not None else registry.names(),
+                user_api_key_dict.team_id,
+            ),
         )
     )
 
@@ -19444,6 +19454,9 @@ async def model_group_info(
                 infer_model_from_keys=general_settings.get("infer_model_from_keys", False),
                 return_wildcard_routes=False,
                 llm_router=llm_router,
+                caller_secret_fields=await get_user_provider_listing_secret_fields(
+                    user_api_key_dict, llm_router, llm_router.registry().names(), None
+                ),
             )
         )
         if is_proxy_admin

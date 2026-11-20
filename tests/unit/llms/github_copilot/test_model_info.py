@@ -15,6 +15,7 @@ import litellm
 from litellm.exceptions import (
     AuthenticationError,
     CallerCredentialAuthenticationError,
+    ModelNotMappedError,
     RateLimitError,
     ServiceUnavailableError,
     Timeout,
@@ -27,7 +28,7 @@ from litellm.llms.github_copilot.github_host import github_host_endpoints
 from litellm.llms.github_copilot.model_info import GithubCopilotModelInfo
 from litellm.llms.github_copilot.per_user_auth import attach_github_copilot_user_session
 from litellm.types.utils import CredentialItem
-from litellm.utils import AvailableModelsCache
+from litellm.utils import AvailableModelsCache, get_model_info_helper
 
 _NOW: Final = 1_800_000_000.0
 _USER_API: Final = "https://api.user.githubcopilot.com"
@@ -247,6 +248,44 @@ def test_rejected_catalogs_are_not_cached_or_exposed(shared_token: Path, status:
     assert shared_token.read_text() not in str(failure.value)
 
 
+def test_bridged_session_preserves_the_discovery_cache_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        litellm,
+        "credential_list",
+        [
+            CredentialItem(
+                credential_name=name,
+                credential_info={},
+                credential_values={"github_copilot_auth_type": "per_user_oauth"},
+            )
+            for name in ("personal", "other")
+        ],
+    )
+    catalogs: Final = SimpleQueue[httpx.Request]()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/copilot_internal/user":
+            return httpx.Response(200, json={"endpoints": {"api": _USER_API}})
+        assert request.url.path == "/models"
+        catalogs.put(request)
+        return httpx.Response(200, json={"data": [{"id": "scope-model"}]})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http_client:
+        client: Final = HTTPHandler(client=http_client)
+        monkeypatch.setattr(litellm, "module_level_client", client)
+        info: Final = GithubCopilotModelInfo(client=client, cache=AvailableModelsCache())
+        for name, user in (("personal", "first"), ("personal", "second"), ("other", "first")):
+            original: Final = dict(_user_params(name, user, "same-account-token"))
+            attach_github_copilot_user_session(original)
+            expected: Final = info.discover_models(original)
+            bridged: Final = {
+                "github_copilot_auth_type": "per_user_oauth",
+                "github_copilot_user_session": original["github_copilot_user_session"],
+            }
+            assert info.discover_models(bridged) == expected == ["github_copilot/scope-model"]
+    assert catalogs.qsize() == 3
+
+
 def test_concurrent_listings_single_flight_and_shared_token_rotation(shared_token: Path) -> None:
     requests: Final = SimpleQueue[httpx.Request]()
 
@@ -283,3 +322,202 @@ def test_catalog_timeout_is_not_a_successful_empty_listing(shared_token: Path) -
         info: Final = GithubCopilotModelInfo(client=HTTPHandler(client=http_client), cache=AvailableModelsCache())
         with pytest.raises(Timeout, match="model discovery timed out"):
             info.get_models(api_base=_SHARED_API)
+
+
+@pytest.mark.parametrize(
+    ("endpoints", "expected_mode"),
+    [
+        (("/chat/completions", "/v1/responses"), "responses"),
+        (("/v1/chat/completions",), "chat"),
+        (("/embeddings",), "embedding"),
+    ],
+)
+def test_discovered_model_metadata_reaches_the_core_without_global_registration(
+    shared_token: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    endpoints: tuple[str, ...],
+    expected_mode: str,
+) -> None:
+    requests: Final = SimpleQueue[httpx.Request]()
+    model: Final = f"catalog-metadata-{shared_token.parent.name}"
+    limits: Final = {"max_context_window": 32000, "max_prompt_tokens": 24000, "max_output_tokens": 8000}
+    supports: Final = {"tool_calls": True, "vision": True, "streaming": True}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put(request)
+        assert request.url.path == "/models"
+        assert request.headers["authorization"] == f"Bearer {shared_token.read_text()}"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": model,
+                        "supported_endpoints": endpoints,
+                        "capabilities": {"limits": limits, "supports": supports},
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http_client:
+        client: Final = HTTPHandler(client=http_client)
+        monkeypatch.setattr(litellm, "module_level_client", client)
+        discovered: Final = GithubCopilotModelInfo(client=client).get_models(api_base=_SHARED_API)
+        metadata: Final = get_model_info_helper(
+            model=discovered[0],
+            custom_llm_provider="github_copilot",
+            api_base=_SHARED_API,
+            api_key=shared_token.read_text(),
+        )
+
+    assert discovered == [f"github_copilot/{model}"]
+    assert metadata["mode"] == expected_mode
+    assert metadata["max_tokens"] == limits["max_context_window"]
+    assert metadata["max_input_tokens"] == limits["max_prompt_tokens"]
+    assert metadata["max_output_tokens"] == limits["max_output_tokens"]
+    assert metadata.get("supports_function_calling") == supports["tool_calls"]
+    assert metadata.get("supports_vision") == supports["vision"]
+    assert metadata["input_cost_per_token"] is None
+    assert metadata["output_cost_per_token"] is None
+    assert requests.qsize() == 1
+    assert discovered[0] not in litellm.model_cost
+
+
+def test_runtime_metadata_isolated_across_callers_rotation_and_disconnect(
+    shared_token: Path, user_credential: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: Final = SimpleQueue[httpx.Request]()
+    model: Final = f"caller-metadata-{shared_token.parent.name}"
+    first_token: Final = f"first-{shared_token.parent.name}"
+    second_token: Final = f"second-{shared_token.parent.name}"
+    rotated_token: Final = f"rotated-{shared_token.parent.name}"
+    first: Final = _user_params(user_credential, "first", first_token)
+    second: Final = _user_params(user_credential, "second", second_token)
+    rotated: Final = _user_params(user_credential, "first", rotated_token)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/copilot_internal/user":
+            return _catalog_for_bearer(request)
+        requests.put(request)
+        token: Final = request.headers["authorization"].removeprefix("Bearer ")
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": model,
+                        "supported_endpoints": ["/responses" if token == first_token else "/chat/completions"],
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http_client:
+        client: Final = HTTPHandler(client=http_client)
+        monkeypatch.setattr(litellm, "module_level_client", client)
+        info: Final = GithubCopilotModelInfo(client=client, cache=AvailableModelsCache())
+        assert info.discover_models(first) == [f"github_copilot/{model}"]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results: Final = tuple(
+                pool.map(lambda params: info.get_model_info(model, litellm_params=params), (first, second) * 8)
+            )
+        rotated_info: Final = info.get_model_info(model, litellm_params=rotated)
+        with pytest.raises(CallerCredentialAuthenticationError, match="Connect GitHub Copilot"):
+            info.get_model_info(model, litellm_params={"litellm_credential_name": user_credential})
+
+    assert tuple(result["mode"] for result in results) == ("responses", "chat") * 8
+    assert rotated_info["mode"] == "chat"
+    assert requests.qsize() == 3
+    assert model not in litellm.model_cost
+
+
+@pytest.mark.parametrize("mode", ["chat", "responses"])
+def test_registered_routing_and_pricing_do_not_require_catalog_access(
+    shared_token: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    model: Final = f"github_copilot/registered-metadata-{shared_token.parent.name}"
+    registered: Final = {
+        "mode": mode,
+        "litellm_provider": "github_copilot",
+        "max_tokens": 16000,
+        "max_input_tokens": 24000,
+        "max_output_tokens": 16000,
+        "input_cost_per_token": 0.000002,
+        "output_cost_per_token": 0.000004,
+    }
+    monkeypatch.setattr(litellm, "model_cost", {**litellm.model_cost, model: registered})
+    shared_token.unlink()
+
+    def reject_network(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"Registered routing must not require discovery at {request.url.path}")
+
+    with httpx.Client(transport=httpx.MockTransport(reject_network)) as http_client:
+        info: Final = GithubCopilotModelInfo(client=HTTPHandler(client=http_client), cache=AvailableModelsCache())
+        metadata: Final = info.get_model_info(model)
+
+    assert metadata["mode"] == registered["mode"]
+    assert metadata["max_tokens"] == registered["max_tokens"]
+    assert metadata["input_cost_per_token"] == registered["input_cost_per_token"]
+    assert metadata["output_cost_per_token"] == registered["output_cost_per_token"]
+
+
+@pytest.mark.parametrize("entry", [{"id": "id-only"}, {"id": "other", "supported_endpoints": ["/responses"]}])
+def test_missing_model_capabilities_do_not_become_chat_metadata(
+    shared_token: Path, entry: Mapping[str, object]
+) -> None:
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"data": [entry]}))
+    ) as http_client:
+        info: Final = GithubCopilotModelInfo(client=HTTPHandler(client=http_client), cache=AvailableModelsCache())
+        assert info.get_models(api_base=_SHARED_API) == [f"github_copilot/{entry['id']}"]
+        with pytest.raises(ServiceUnavailableError, match="routing capabilities|absent"):
+            info.get_model_info("id-only", api_base=_SHARED_API, api_key=shared_token.read_text())
+
+
+def test_credential_free_metadata_does_not_cache_a_saved_accounts_catalog(
+    shared_token: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: Final = SimpleQueue[httpx.Request]()
+    model: Final = f"unscoped-metadata-{shared_token.parent.name}"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put(request)
+        return httpx.Response(200, json={"data": [{"id": model, "supported_endpoints": ["/responses"]}]})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http_client:
+        monkeypatch.setattr(litellm, "module_level_client", HTTPHandler(client=http_client))
+        with pytest.raises(ModelNotMappedError):
+            litellm.get_model_info(model=model, custom_llm_provider="github_copilot", api_base=_SHARED_API)
+
+    assert requests.empty()
+
+
+def test_explicit_metadata_credentials_do_not_borrow_the_saved_account(
+    shared_token: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: Final = SimpleQueue[httpx.Request]()
+    model: Final = f"explicit-metadata-{shared_token.parent.name}"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put(request)
+        endpoint: Final = (
+            "/responses" if request.headers["authorization"] == "Bearer explicit-first" else "/chat/completions"
+        )
+        return httpx.Response(200, json={"data": [{"id": model, "supported_endpoints": [endpoint]}]})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http_client:
+        monkeypatch.setattr(litellm, "module_level_client", HTTPHandler(client=http_client))
+        metadata: Final = tuple(
+            litellm.get_model_info(
+                model=model, custom_llm_provider="github_copilot", api_base=_SHARED_API, api_key=token
+            )
+            for token in ("explicit-first", "explicit-second", "explicit-first")
+        )
+
+    assert tuple(info["mode"] for info in metadata) == ("responses", "chat", "responses")
+    seen: Final = tuple(requests.get_nowait() for _ in range(requests.qsize()))
+    assert tuple(request.headers["authorization"] for request in seen) == (
+        "Bearer explicit-first",
+        "Bearer explicit-second",
+    )

@@ -3695,6 +3695,52 @@ async def _team_router_settings(user_api_key_dict_team_id: str | None) -> Mappin
         return None
 
 
+async def _get_user_provider_secret_fields(
+    authenticated_user_id: str | None,
+    credential_names: Sequence[str],
+) -> Mapping[str, object] | None:
+    if not authenticated_user_id or not credential_names:
+        return None
+
+    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
+    from litellm.types.proxy.litellm_pre_call_utils import RedactedDict
+
+    from .credential_endpoints.user_provider_credentials import aget_user_provider_credentials
+
+    if prisma_client is None:
+        return None
+    try:
+        connections: Final = await aget_user_provider_credentials(
+            prisma_client=prisma_client,
+            cache=user_api_key_cache,
+            user_id=authenticated_user_id,
+            credential_names=credential_names,
+        )
+    except Exception:  # noqa: BLE001  # preserve inference fallback when credential loading fails
+        verbose_proxy_logger.exception(
+            "_resolve_user_provider_credentials_for_request: failed to load user provider credentials"
+        )
+        return None
+    return RedactedDict(
+        {
+            "user_provider_credentials": RedactedDict(dict(connections)),
+            "user_provider_credentials_user_id": authenticated_user_id,
+        }
+    )
+
+
+async def get_user_provider_listing_secret_fields(
+    user_api_key_dict: UserAPIKeyAuth,
+    llm_router: litellm.Router | None,
+    model_groups: Iterable[str],
+    team_id: str | None,
+) -> Mapping[str, object] | None:
+    if not user_api_key_dict.user_id or llm_router is None or not _per_user_oauth_configured():
+        return None
+    credential_names: Final = _per_user_credential_names_for_groups(llm_router, frozenset(model_groups), team_id)
+    return await _get_user_provider_secret_fields(user_api_key_dict.user_id, credential_names)
+
+
 async def _resolve_user_provider_credentials_for_request(
     data: dict[str, object],  # mutable-ok: writes resolved credentials into the nested secret_fields dict
     authenticated_user_id: str | None,
@@ -3773,31 +3819,14 @@ async def _resolve_user_provider_credentials_for_request(
     if not isinstance(user_id, str) or not user_id or not credential_names:
         return
 
-    from litellm.proxy.proxy_server import prisma_client, user_api_key_cache
-    from litellm.types.proxy.litellm_pre_call_utils import RedactedDict
-
-    from .credential_endpoints.user_provider_credentials import aget_user_provider_credentials
-
-    if prisma_client is None:
-        return
-    try:
-        connections: Final = await aget_user_provider_credentials(
-            prisma_client=prisma_client,
-            cache=user_api_key_cache,
-            user_id=user_id,
-            credential_names=credential_names,
-        )
-    except Exception:  # noqa: BLE001  # credential lookup failures degrade to the shared deployment, never break the request
-        verbose_proxy_logger.exception(
-            "_resolve_user_provider_credentials_for_request: failed to load user provider credentials"
-        )
+    resolved_secret_fields: Final = await _get_user_provider_secret_fields(user_id, credential_names)
+    if resolved_secret_fields is None:
         return
 
     secret_fields: Final = data.get("secret_fields")
     if not isinstance(secret_fields, dict):
         return
-    secret_fields["user_provider_credentials"] = RedactedDict(dict(connections))
-    secret_fields["user_provider_credentials_user_id"] = user_id
+    secret_fields.update(resolved_secret_fields)
 
 
 def _warn_stale_team_alias_once(warning_key: str, message: str, *args: str) -> None:

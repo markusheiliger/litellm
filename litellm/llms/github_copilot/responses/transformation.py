@@ -19,10 +19,9 @@ from typing import (
 
 from pydantic import TypeAdapter
 
-import litellm
 from litellm._logging import verbose_logger
 from litellm.constants import DEFAULT_MAX_RECURSE_DEPTH
-from litellm.exceptions import AuthenticationError
+from litellm.exceptions import AuthenticationError, ServiceUnavailableError
 from litellm.litellm_core_utils.url_utils import join_api_base
 from litellm.llms.base_llm.responses.transformation import STANDARD_MODE_REASONING_FIELD_VALUES, ReasoningFieldValues
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
@@ -33,7 +32,6 @@ from litellm.types.llms.openai import (
 )
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
-from litellm.utils import cached_get_model_info_helper
 
 from ..authenticator import Authenticator
 from ..common_utils import (
@@ -42,6 +40,7 @@ from ..common_utils import (
     get_copilot_default_headers,
     pin_session_authorization,
 )
+from ..model_info import github_copilot_routing_mode
 from ..per_user_auth import require_github_copilot_user_session
 
 if TYPE_CHECKING:
@@ -55,40 +54,23 @@ _OBJECT_LIST: Final = TypeAdapter(list[object])
 _OBJECT_MAPPING: Final = TypeAdapter(Mapping[object, object])
 
 
-def github_copilot_supports_responses_api(model: str) -> bool:
-    """
-    Gate native /v1/responses dispatch per github_copilot model.
+def github_copilot_supports_responses_api(model: str, model_info: object = None) -> bool:
+    return model.startswith("responses/") or github_copilot_routing_mode(model, model_info) == "responses"
 
-    Resolution (first match wins): mode "responses" -> True; mode "chat" ->
-    False (opt-out wins for dual-endpoint models); "/v1/responses" in
-    supported_endpoints -> True; else False. Unknown model -> False (the bridge
-    always works since every Copilot model supports /chat/completions).
 
-    Reads merged model info (per-deployment model_info applied via the router's
-    register_model, which also clears the cache used here).
-    """
-    try:
-        info: Final = cached_get_model_info_helper(model=model, custom_llm_provider="github_copilot")
-    except Exception as e:
-        verbose_logger.debug(
-            "github_copilot_supports_responses_api: get_model_info failed for %s: %s",
-            model,
-            e,
+def github_copilot_chat_bridge_check(
+    model: str, model_info: object
+) -> tuple[dict[str, object], str]:  # mutable-ok: existing bridge result contract
+    if model.startswith("responses/"):
+        return {"mode": "responses"}, model.removeprefix("responses/")
+    mode: Final = github_copilot_routing_mode(model, model_info)
+    if mode is None:
+        raise ServiceUnavailableError(
+            message="GitHub Copilot requires authenticated model capabilities before inference routing.",
+            llm_provider="github_copilot",
+            model=model,
         )
-        return False
-
-    mode: Final = info.get("mode")
-    if mode == "responses":
-        return True
-    if mode == "chat":
-        return False
-
-    # supported_endpoints is dropped by ModelInfoBase; read it from the raw
-    # model_cost entry via the resolved key.
-    key: Final = info.get("key")
-    raw_info: Final = litellm.model_cost.get(key) if isinstance(key, str) else None
-    endpoints: Final = raw_info.get("supported_endpoints") if isinstance(raw_info, dict) else None
-    return isinstance(endpoints, list) and "/v1/responses" in endpoints
+    return {"mode": mode}, model
 
 
 class GithubCopilotResponsesAPIConfig(OpenAIResponsesAPIConfig):
@@ -112,6 +94,10 @@ class GithubCopilotResponsesAPIConfig(OpenAIResponsesAPIConfig):
         super().__init__()
         self.authenticator = Authenticator()
         self._stream_item_ids_by_output_index: dict[int, str] = {}
+
+    @classmethod
+    def for_model(cls, model: str, model_info: object = None) -> "GithubCopilotResponsesAPIConfig | None":
+        return cls() if github_copilot_supports_responses_api(model, model_info) else None
 
     @property
     def custom_llm_provider(self) -> LlmProviders:

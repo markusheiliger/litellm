@@ -772,6 +772,10 @@ class _AsyncPromptManagementOutcome:
 def _resolve_responses_api_provider_config(
     model: str, custom_llm_provider: str, model_info: object, api_base: str | None
 ) -> BaseResponsesAPIConfig | None:
+    if custom_llm_provider == "github_copilot":
+        from litellm.llms.github_copilot.responses.transformation import GithubCopilotResponsesAPIConfig
+
+        return GithubCopilotResponsesAPIConfig.for_model(model, model_info)
     provider_config: Final = ProviderConfigManager.get_provider_responses_api_config(
         model=model, provider=custom_llm_provider, api_base=api_base
     )
@@ -1055,6 +1059,15 @@ async def aresponses(
                     kwargs={**kwargs, "extra_headers": extra_headers},
                     prompt_id=prompt_id,
                 )
+                if custom_llm_provider == "github_copilot":
+                    from litellm.llms.github_copilot.per_user_auth import aprepare_github_copilot_request
+
+                    await aprepare_github_copilot_request(
+                        cast("dict[str, object]", kwargs),  # cast-ok: Python keyword arguments have string keys
+                        model=model,
+                        call_type="aresponses",
+                        reset_model_info=requested_provider != custom_llm_provider,
+                    )
             kwargs.pop("prompt_id", None)
             kwargs["_async_prompt_merged_params"] = _AsyncPromptManagementOutcome(
                 merged_optional_params=merged_optional_params,
@@ -1241,6 +1254,15 @@ def _apply_prompt_management_to_responses_call(
         local_vars["custom_llm_provider"] = resolved_provider
         for key, value in merged_optional_params.items():
             local_vars[key] = value
+        if model != original_model and resolved_provider == "github_copilot":
+            from litellm.llms.github_copilot.per_user_auth import prepare_github_copilot_request
+
+            prepare_github_copilot_request(
+                kwargs,
+                model=model,
+                call_type="responses",
+                reset_model_info=resolved_provider != custom_llm_provider,
+            )
         return (
             input,
             model,

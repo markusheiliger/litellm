@@ -33,6 +33,54 @@ from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
 from litellm.types.utils import Choices, Message, ModelResponse, Usage
 
 
+@pytest.mark.parametrize(("backend_mode", "deployment_mode"), [("chat", "responses"), ("responses", "chat")])
+def test_copilot_bridge_honors_the_deployments_explicit_routing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, backend_mode: str, deployment_mode: str
+) -> None:
+    model: Final = f"deployment-routing-{tmp_path.name}"
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {
+            **litellm.model_cost,
+            f"github_copilot/{model}": {"litellm_provider": "github_copilot", "mode": backend_mode},
+        },
+    )
+    info, selected_model = responses_api_bridge_check(
+        model=model,
+        custom_llm_provider="github_copilot",
+        deployment_model_info={"mode": deployment_mode},
+    )
+
+    assert info["mode"] == deployment_mode
+    assert selected_model == model
+
+
+@pytest.mark.parametrize(("backend_mode", "deployment_mode"), [("chat", "responses"), ("responses", "chat")])
+def test_copilot_responses_selection_honors_deployment_routing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, backend_mode: str, deployment_mode: str
+) -> None:
+    model: Final = f"responses-deployment-routing-{tmp_path.name}"
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {
+            **litellm.model_cost,
+            f"github_copilot/{model}": {"litellm_provider": "github_copilot", "mode": backend_mode},
+        },
+    )
+    config: Final = import_module("litellm.responses.main")._resolve_responses_api_provider_config(
+        model, "github_copilot", {"mode": deployment_mode}, None
+    )
+
+    if deployment_mode == "responses":
+        from litellm.llms.github_copilot.responses.transformation import GithubCopilotResponsesAPIConfig
+
+        assert isinstance(config, GithubCopilotResponsesAPIConfig)
+    else:
+        assert config is None
+
+
 class TestUseResponsesApiBridgeFlag:
     """Test that bridge opt-in forces the chat completions path."""
 
@@ -1193,10 +1241,15 @@ async def test_chatgpt_completion_routes_to_responses_without_a_provider_catalog
     ]
 
 
-@pytest.mark.parametrize("provider", ["openai", "azure", "xai", "github_copilot"])
+@pytest.mark.parametrize("provider", ["openai", "azure", "xai"])
 def test_missing_catalog_entry_does_not_force_other_providers_to_responses(provider: str) -> None:
     info, model = responses_api_bridge_check(model="test-chatgpt-routing-control", custom_llm_provider=provider)
     assert (info.get("mode"), model) == (None, "test-chatgpt-routing-control")
+
+
+def test_copilot_unknown_routing_requires_prepared_capabilities() -> None:
+    with pytest.raises(litellm.ServiceUnavailableError, match="requires authenticated model capabilities"):
+        responses_api_bridge_check(model="test-copilot-routing-control", custom_llm_provider="github_copilot")
 
 
 _GPT_5_6_CHUNKS: Final = (

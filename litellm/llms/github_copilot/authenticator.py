@@ -3,11 +3,11 @@ import json
 import os
 import time
 from collections.abc import Mapping
-from typing import (  # noqa: TID251  # pins untyped clients and caches to local Protocols
+from typing import (
     TYPE_CHECKING,
     Final,
     Protocol,
-    cast,
+    cast,  # noqa: TID251  # pins untyped clients and caches to local Protocols
 )
 
 import httpx

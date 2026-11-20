@@ -26,6 +26,24 @@ Your development login does not need to change.
 
 ## Proxy setup
 
+Discovery retains endpoint capabilities for authenticated inference without adding account-specific models to the
+bundled model table. Explicit deployment routing and existing bundled routing take precedence. When routing is
+missing, a model advertising Responses uses the native Copilot Responses API. Chat-only models stay on Chat
+Completions. An ID-only catalog entry can be listed, but inference fails explicitly if its routing cannot be resolved.
+
+The catalog cache is scoped to the selected authentication mode, caller, named credential, host, integration and
+token. Wildcard listings load the authenticated proxy user's stored connection through the existing credential loader.
+An unconnected user cannot reuse another account's warm catalog or shared token. Connection fields are not returned
+in model-info responses.
+
+Credential-free generic metadata lookups remain limited to bundled or configured metadata. Standalone runtime
+metadata lookup requires explicit credentials. Normal SDK inference resolves its configured shared, per-user or App
+authentication automatically before preparing runtime metadata.
+
+Per-user Chat-to-Responses calls reuse the existing resolved session. Its private caller and credential scope
+preserves catalog isolation without forwarding raw connection fields through the shared bridge. Credential removal,
+auth-mode or host changes and explicit disconnects prevent reuse. A changed caller token resolves a fresh session.
+
 Use an externally provisioned proxy built from the revision under test. The tests do not start a proxy, register a
 GitHub App or approve device logins during test runs. The separate `--auth` setup mode guides OAuth approval.
 Use the normal Postgres, shared Redis, management and spend-log configuration
